@@ -1,0 +1,7 @@
+# Local Qwen3.5-9B for the DataMate harness (scripts/ollama_run.sh).
+# The base model ships presence_penalty 1.5 (good for chat, bad for code: it punishes repeated identifiers) and a 32k
+# context. Prompts are long (rulebook + README + schema + spec + plan + earlier blocks); Ollama truncates silently when a
+# prompt exceeds num_ctx, so the window is raised. Temperature is set per request by the harness (0.0).
+FROM qwen3.5:9b-mlx
+PARAMETER num_ctx 65536
+PARAMETER presence_penalty 0

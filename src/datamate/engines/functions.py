@@ -1,0 +1,167 @@
+"""The rulebook engines as functions the coder can CALL (they no longer answer questions themselves).
+
+The engines compute the standard numbers correctly (valid orders only, order date, quantities in base units), but as
+answerers they had to guess which question they were looking at, and that routing needed a growing set of wording rules
+tuned to the training questions. Now the coder reads the question, decides, and calls an engine when it fits: the
+answer is always the coder's code. Misuse is loud: an unknown item name raises an error that lists the closest names,
+instead of silently returning 0.
+"""
+from __future__ import annotations
+
+import difflib
+from typing import Callable
+
+import pandas as pd
+
+from datamate.engines.debt import DebtView
+from datamate.engines.items import ItemView, fold
+from datamate.engines.orders import top_customers as _top_customers
+from datamate.engines.purchases import PurchaseView, closest as _closest_items
+from datamate.engines.sales import SalesView
+
+
+def _ts(x) -> pd.Timestamp:
+    return pd.Timestamp(x).normalize()
+
+
+def _num(x: float):
+    return int(round(x)) if abs(x - round(x)) < 1e-9 else round(float(x), 4)
+
+
+def build_tools(sales: SalesView | None, items: ItemView | None, debt: DebtView | None = None,
+                orders: pd.DataFrame | None = None, purchases: PurchaseView | None = None) -> dict[str, Callable]:
+    """Functions for the coder sandbox. Dates: 'YYYY-MM-DD' strings or Timestamps, both ends included."""
+    tools: dict[str, Callable] = {}
+
+    if sales is not None:
+        def sales_metrics(start, end) -> dict:
+            """Whole-shop {'revenue', 'orders', 'avg_order'} for valid orders (no cancelled/returned) placed in [start, end]."""
+            m = sales.metrics(_ts(start), _ts(end))
+            return {"revenue": m["revenue"], "orders": m["orders"], "avg_order": m["avg_order"]}
+        tools["sales_metrics"] = sales_metrics
+
+    if items is not None:
+        keys = set(items.lines.loc[items.lines["is_item"], "key"].dropna().astype(str))
+
+        def _key(item: str) -> str:
+            k = fold(item)
+            if k in keys:
+                return k
+            names = [items.display.get(c, c) for c in difflib.get_close_matches(k, sorted(keys), n=5, cutoff=0.5)]
+            raise ValueError(f"no item named {item!r}; closest names in the data: {names}. Use find_items(...) to search.")
+
+        def find_items(text: str, n: int = 10) -> list[str]:
+            """Item names (exact data spelling) containing `text` (case/diacritics ignored); closest names if none contain it."""
+            t = fold(text)
+            hit = sorted(k for k in keys if t and t in k)
+            if not hit:
+                hit = difflib.get_close_matches(t, sorted(keys), n=n, cutoff=0.4)
+            return [items.display.get(k, k) for k in hit[:n]]
+
+        def item_qty(item: str, start, end):
+            """Quantity sold in BASE units of `item` over [start, end], valid orders only."""
+            return _num(items.qty(_key(item), _ts(start), _ts(end)))
+
+        def item_revenue(item: str, start, end) -> int:
+            """Revenue (line amounts) of `item` over [start, end], valid orders only."""
+            return items.revenue(_key(item), _ts(start), _ts(end))
+
+        def item_base_unit(item: str):
+            return items.base_unit(_key(item))
+
+        def top_items(k: int, start, end, by: str = "qty") -> list:
+            """[(name, value)] best sellers over [start, end]; by='qty' (base units) or 'amount' (revenue). Ties: by item code."""
+            if by not in ("qty", "amount"):
+                raise ValueError("by must be 'qty' or 'amount'")
+            return [(name, _num(v)) for name, v in items.top(int(k), _ts(start), _ts(end), by=by)]
+
+        def item_price_on(item: str, day):
+            """Unit price per base unit of `item` on orders placed on `day` (None if it was not sold that day)."""
+            return items.price_on(_key(item), _ts(day))
+
+        def item_qty_change(item: str, day, n: int) -> dict:
+            """{'before', 'after', 'pct'}: quantity in the n days from `day` (included) vs the n days right before."""
+            return items.change(_key(item), _ts(day), int(n))
+
+        def size_qty(size: str, start, end):
+            """Quantity of drinks/items of size `size` ('M', 'L', ...) over [start, end]."""
+            return _num(items.size_qty(size, _ts(start), _ts(end)))
+
+        tools.update(find_items=find_items, item_qty=item_qty, item_revenue=item_revenue, item_base_unit=item_base_unit,
+                     top_items=top_items, item_price_on=item_price_on, item_qty_change=item_qty_change, size_qty=size_qty)
+
+    if debt is not None:  # rulebook §4, see engines/debt.py
+        def debt_total(day, older_than_days=None) -> int:
+            """Money customers still owe at the end of `day` (orders placed more than `older_than_days` days before, if given)."""
+            return debt.total_owed(_ts(day), None if older_than_days is None else int(older_than_days))
+
+        def debt_by_customer(day, k=None) -> list:
+            """[(customer name, owed)] at the end of `day`, largest first; walk-in orders have no row."""
+            rows = debt.by_customer(_ts(day))
+            return rows[: int(k)] if k else rows
+
+        def debt_customers(day) -> int:
+            """Number of customers who still owe money at the end of `day`."""
+            return len(debt.by_customer(_ts(day)))
+
+        def debt_aging(day, edges=(7, 15)) -> list:
+            """Owed money by age since the order date: [0..7, 8..15, >15] days for the default edges."""
+            return debt.aging(_ts(day), tuple(int(e) for e in edges))
+
+        def debt_repaid(start, end, customer=None) -> int:
+            """Debt repayments dated in [start, end] (payments after the purchase day, credit orders), optionally one customer."""
+            return debt.repaid(_ts(start), _ts(end), customer)
+
+        def debt_new(start, end, customer=None) -> int:
+            """New debt from credit orders placed in [start, end] (unpaid at the end of the purchase day), optionally one customer."""
+            return debt.new_debt(_ts(start), _ts(end), customer)
+
+        tools.update(debt_total=debt_total, debt_by_customer=debt_by_customer, debt_customers=debt_customers,
+                     debt_aging=debt_aging, debt_repaid=debt_repaid, debt_new=debt_new)
+
+    if purchases is not None:  # rulebook §5, see engines/purchases.py
+        pkeys = set(purchases.lines["key"].astype(str))
+
+        def _pkey(item: str) -> str:
+            k = fold(item)
+            if k not in pkeys:
+                raise ValueError(f"no purchased item named {item!r}; closest names in the purchase data: {_closest_items(purchases, k)}")
+            return k
+
+        def purchase_total(start, end) -> int:
+            """Money of the purchase slips dated in [start, end] (cancelled slips left out): `tổng tiền nhập hàng`."""
+            return int(round(purchases.total(_ts(start), _ts(end))))
+
+        def purchase_avg_price(item: str, start, end, unit=None):
+            """Average import price of `item` per `unit` over the slips dated in [start, end], WEIGHTED by the quantity bought
+            (not the mean of the prices), in the unit of the purchase line. `unit` (e.g. 'thùng') keeps the lines in that unit;
+            without it the item must have been bought in one unit, otherwise the units are listed. None when nothing was bought."""
+            k, s, e = _pkey(item), _ts(start), _ts(end)
+            if unit is None:
+                us = purchases.units(k, s, e)
+                if len(us) > 1:
+                    raise ValueError(f"{item!r} was bought in several units in this period {us}: pass unit=...")
+            v = purchases.avg_price(k, s, e, unit)
+            return None if v is None else int(round(v))
+
+        tools.update(purchase_total=purchase_total, purchase_avg_price=purchase_avg_price)
+        if purchases.lines["supplier"].notna().any():
+            def top_supplier(start, end, k=1) -> list:
+                """[(supplier, money)] of the slips dated in [start, end], largest first (`nhà cung cấp nhập nhiều nhất`: the first)."""
+                return [(n, int(round(v))) for n, v in purchases.top_suppliers(_ts(start), _ts(end), int(k))]
+            tools["top_supplier"] = top_supplier
+
+    if orders is not None and "customer_key" in orders.columns:   # rulebook §3, see engines/orders.py
+        def top_customers(k=None, start=None, end=None) -> list:
+            """[(customer, revenue)] for valid orders placed in [start, end], largest first; one customer per customer
+            code, walk-in orders never ranked (§3). Ties: by customer code."""
+            lo = start if start is not None else orders["date"].min()
+            hi = end if end is not None else orders["date"].max()
+            return _top_customers(orders, None if k is None else int(k), lo, hi)
+        tools["top_customers"] = top_customers
+    return tools
+
+
+TOOL_NAMES = ("sales_metrics", "find_items", "item_qty", "item_revenue", "item_base_unit", "top_items", "item_price_on",
+              "item_qty_change", "size_qty", "debt_total", "debt_by_customer", "debt_customers", "debt_aging", "debt_repaid",
+              "debt_new", "top_customers", "purchase_total", "purchase_avg_price", "top_supplier", "sales_orders")
