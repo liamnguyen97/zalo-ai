@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 
 from smolagents import OpenAIModel
 
@@ -27,6 +28,13 @@ def set_session(session_id: str | None) -> None:
 def reset_usage() -> None:
     _usage.calls = _usage.in_tok = _usage.out_tok = _usage.cached = 0
     _usage.cost = 0.0
+    _usage.call_log = []
+
+
+def get_call_log() -> list[dict]:
+    """One record per model call of this question: stage, seconds, tokens in / cached / out, whether the output cap was hit.
+    The first local runs had 5 of 201 calls write ~4,000 tokens (the cap) and nothing said which stage they came from."""
+    return list(getattr(_usage, "call_log", []))
 
 
 def get_usage() -> dict:
@@ -102,15 +110,36 @@ def build_model(settings: Settings, *, temperature: float | None = None, seed: i
     )
 
 
-def chat(model: OpenAIModel, system: str, user: str, temperature: float | None = None) -> str:
-    """Single-shot completion used by the non-agentic stages (column selector, explainer, plan). Missing content is "":
-    a thinking call that spends its whole budget on reasoning returns no content, which str() used to turn into the
-    text "None" (88 of 150 holdout6 r7 plans reached the Coder as "KẾ HOẠCH: None")."""
+def chat(model: OpenAIModel, system: str, user: str, temperature: float | None = None, *, stage: str = "other",
+         max_tokens: int | None = None, context: str | None = None) -> str:
+    """Single-shot completion used by every stage. Missing content is "": a thinking call that spends its whole budget on
+    reasoning returns no content, which str() used to turn into the text "None" (88 of 150 holdout6 r7 plans reached the
+    Coder as "KẾ HOẠCH: None"). `stage` names the call in the per-question call log; `max_tokens` caps a stage whose
+    answer is short (a JSON verdict), so a runaway generation stops early instead of filling the model's whole budget.
+    `context` (agents/shared.py) is put before the stage's system prompt."""
+    if context:   # agents/shared.py: the shop's context first, identical in every step, so the prefix cache serves it
+        from datamate.agents.shared import with_context
+        system = with_context(context, system)
     messages = [
         {"role": "system", "content": [{"type": "text", "text": system}]},
         {"role": "user", "content": [{"type": "text", "text": user}]},
     ]
-    content = (model.generate(messages) if temperature is None else model.generate(messages, temperature=temperature)).content
+    kw = {}
+    if temperature is not None:
+        kw["temperature"] = temperature
+    if max_tokens is not None and isinstance(model, OpenAIModel):      # scripted test models take no generation options
+        kw["max_tokens"] = max_tokens
+    before, t0 = get_usage(), time.time()
+    content = model.generate(messages, **kw).content
+    after = get_usage()
+    out_tok = after["output_tokens"] - before["output_tokens"]
+    defaults = getattr(model, "kwargs", None)
+    cap = kw.get("max_tokens") or (defaults.get("max_tokens") if isinstance(defaults, dict) else None)
+    if not hasattr(_usage, "call_log"):
+        _usage.call_log = []
+    _usage.call_log.append({"stage": stage, "s": round(time.time() - t0, 2), "in": after["input_tokens"] - before["input_tokens"],
+                            "cached": after["cached_tokens"] - before["cached_tokens"], "out": out_tok,
+                            "capped": bool(cap) and out_tok >= int(cap) - 2})
     text = content if isinstance(content, str) else "" if content is None else str(content)
     # a server without a reasoning parser returns the trace inline; no caller wants it
     return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()

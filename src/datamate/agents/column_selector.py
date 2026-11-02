@@ -81,13 +81,13 @@ class ColumnSelector:
         tables, cards = st.ctx.tables, st.ctx.descriptors
         user = (f"SHOP README:\n{st.ctx.readme[:6000]}\n\nTABLES:\n{st.ctx.schema}\n\n"
                 f"as_of_date = {st.as_of}\nQUESTION: {st.question}")
-        pick = _json(chat(self.model, SYSTEM, user))
+        pick = _json(chat(self.model, SYSTEM, user, stage="column_selector", max_tokens=1200))
         selection, errs = check(pick, tables)
         log = [{"pick": pick, "errors": errs}]
         for _ in range(self.rounds):
             if not errs:
                 break
-            pick = _json(chat(self.model, SYSTEM, user + "\n\nPREVIOUS ANSWER:\n" + json.dumps(pick, ensure_ascii=False)
+            pick = _json(chat(self.model, SYSTEM, stage="column_selector", max_tokens=1200, user=user + "\n\nPREVIOUS ANSWER:\n" + json.dumps(pick, ensure_ascii=False)
                               + "\nFIX THESE ERRORS (use the exact names in the table descriptions):\n- " + "\n- ".join(errs)))
             fixed, errs = check(pick, tables)
             selection = {**selection, **fixed}

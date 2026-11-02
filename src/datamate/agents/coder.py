@@ -172,6 +172,8 @@ def coder_brief(s) -> str:
         out.append(f"- Measure: {s.measure} = {MEASURE_HINT[s.measure]}.")
     if s.k:
         out.append(f"- Number of elements: {s.k}.")
+    if getattr(s, "unit", None):
+        out.append(f"- Unit asked: {s.unit} (convert to it if the data records another unit).")
     if s.answer_form:
         out.append(f"- Explainer's description: {s.answer_form}")
     out.append('- Assign `answer = <expression computed from the data>`; not enough data: `answer = "UNANSWERABLE: <reason>"`.')
@@ -186,9 +188,11 @@ def build_task(st, rulebook: str, tools: list[str] | None = None) -> str:
     body, output = coder_brief(st.brief)
     have = ", ".join(tools) if tools else "(none)"
     ref, hint = getattr(st, "engine_ref", None), getattr(st, "engine_hint", None)
-    return ("# CONTEXT\n"
-            f"## RULEBOOK\n{rulebook}\n\n## SHOP README\n{st.ctx.readme[:6000]}\n\n## AVAILABLE FUNCTIONS\n{have}\n\n"
-            f"## SCHEMA (tables / columns picked beforehand)\n{st.schema}\n\n"
+    context = ("" if getattr(st, "context", None) else       # shared: the rulebook / README / schema open the system prompt
+               "# CONTEXT\n"
+               f"## RULEBOOK\n{rulebook}\n\n## SHOP README\n{st.ctx.readme[:6000]}\n\n## AVAILABLE FUNCTIONS\n{have}\n\n"
+               f"## SCHEMA (tables / columns picked beforehand)\n{st.schema}\n\n")
+    return (context +
             f"## QUESTION\nas_of_date (today) = {st.as_of}\nORIGINAL QUESTION: {st.question}\n\n"
             f"{body}\n\n"
             + (f"# PLAN (suggested steps)\n{st.plan}\n\n" if st.plan else "")
@@ -214,7 +218,8 @@ class Coder:
     def __init__(self, model):
         self.model = model
 
-    def write(self, task: str, steps: list, feedback: str = "", temperature: float | None = None) -> str | None:
+    def write(self, task: str, steps: list, feedback: str = "", temperature: float | None = None,
+              context: str | None = None) -> str | None:
         """One code block, or None when the reply has none. `steps` are this turn's RunResults. `temperature` overrides
         the model's for this call (used to break out of a repeated block)."""
         parts = [task]
@@ -224,4 +229,4 @@ class Coder:
             parts.append("# CODE BLOCKS ALREADY RUN IN THIS TURN\n" + "\n\n".join(
                 f"## Block {i}\n```python\n{r.code}\n```\nResult:\n{r.feedback()}" for i, r in enumerate(steps, 1)))
         parts.append("Write the NEXT code block (one ```python``` block).")
-        return extract_code(chat(self.model, INSTRUCTIONS, "\n\n".join(parts), temperature=temperature))
+        return extract_code(chat(self.model, INSTRUCTIONS, "\n\n".join(parts), temperature=temperature, stage="coder", context=context))

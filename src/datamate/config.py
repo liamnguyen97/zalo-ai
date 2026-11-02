@@ -76,6 +76,19 @@ class Settings:
     plan_thinking: bool = field(default_factory=lambda: _flag("DATAMATE_PLAN_THINKING", True))
     thinking_max_tokens: int = field(default_factory=lambda: int(os.getenv("DATAMATE_THINKING_MAX_TOKENS", "12288")))
 
+    # P2 (understanding the question). "fast": no Column Selector (every table's card is in the prompt), the question read in code
+    # (agents/question.py), ONE spec call, checks in code, at most one fix call, no orchestrator decision after the spec.
+    # "legacy": Column Selector -> Explainer loop (lookups, blind reading, clarity checks) -> plan -> orchestrator decision.
+    p2_mode: str = field(default_factory=lambda: os.getenv("DATAMATE_P2", "fast"))
+    # Where the plan for the Coder comes from: "spec" = a `method` field of the spec call (no extra call), "call" = the separate
+    # plan call, "none" = no plan (the Coder plans in its first block).
+    plan_mode: str = field(default_factory=lambda: os.getenv("DATAMATE_PLAN_MODE", "spec"))
+    spec_max_tokens: int = field(default_factory=lambda: int(os.getenv("DATAMATE_SPEC_MAX_TOKENS", "3000")))
+    # Every call opens with the same shop context (rulebook, README, schema, functions): the prefix cache serves it across
+    # steps (agents/shared.py). OFF by default: with it the Coder needed 7 and 12 calls on dev300 q_b445c50f6b5e (one abstain)
+    # against 1 and 2 without (ledger #9); to be retried with the Coder's key instructions repeated after the question.
+    shared_prefix: bool = field(default_factory=lambda: _flag("DATAMATE_SHARED_PREFIX", False))
+
     workers: int = field(default_factory=lambda: int(os.getenv("DATAMATE_WORKERS", "4")))
 
     @property

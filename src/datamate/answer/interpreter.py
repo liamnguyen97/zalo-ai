@@ -182,6 +182,26 @@ def _table_issues(raw: Any, spec) -> list[str]:
     return []
 
 
+PERIOD_LABEL = re.compile(r"^\s*(?:\d{4}-\d{1,2}(?:-\d{1,2})?|(?:th[aá]ng|t|q|qu[yý]|tu[aầ]n|ng[aà]y)\s*\d{1,2}(?:\s*[/-]\s*\d{2,4})?)\s*$", re.I)
+
+
+def _list_from_pairs(raw: Any, spec) -> list | None:
+    """A list answer returned as [name, amount] rows: the half the question asks for, or None when that is not clear.
+
+    dev300 q_33e8f7506387 ("top 5 hàng bán chạy"): the first turn returned the right 5 names with their quantities, the check
+    refused the table, and the Coder rebuilt the ranking by hand and got it wrong (abstain). Every list answer of the training
+    gold is names only (106) or numbers only (87), never pairs. Names when the spec asks for a top-k or for names; numbers when
+    the first column labels periods ("doanh thu từng tháng": ['2025-04', 123]); otherwise the check stays."""
+    rows = [r for r in raw if isinstance(r, (list, tuple))] if isinstance(raw, (list, tuple)) else []
+    if not rows or len(rows) != len(raw) or any(len(r) != 2 or not isinstance(r[0], str) or not _is_num(r[1]) for r in rows):
+        return None
+    if all(PERIOD_LABEL.match(r[0]) for r in rows):
+        return [r[1] for r in rows]
+    if getattr(spec, "k", None) or getattr(spec, "measure", None) == "name":
+        return [r[0] for r in rows]
+    return None
+
+
 def interpret(raw: Any, expected: str | None = None, spec=None) -> Interpretation:
     """Type `raw` against the spec's expected answer type and list what looks like a failed computation."""
     if is_unanswerable(raw):
@@ -226,6 +246,8 @@ def interpret(raw: Any, expected: str | None = None, spec=None) -> Interpretatio
             issues.append("type")
     elif expected == "list" and shape == "table" and _is_rows(raw) and all(len(r) == 1 for r in raw if isinstance(r, (list, tuple))):
         raw, kind = [r[0] for r in raw], "list"
+    elif expected == "list" and shape == "table" and (half := _list_from_pairs(raw, spec)) is not None:
+        raw, kind = half, "list"
     else:  # e.g. a list for a "how many" question, a table for a list of numbers: the model answered something else
         kind = shape
         issues.append("type")

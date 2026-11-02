@@ -23,7 +23,7 @@ from datamate.agents.orchestrator import Orchestrator
 from datamate.answer.evaluator import Evaluator
 from datamate.config import Settings
 from datamate.context import BusinessContext, QAState, Split
-from datamate.llm import build_model, get_usage, reset_usage, set_session
+from datamate.llm import build_model, get_call_log, get_usage, reset_usage, set_session
 from datamate.sandbox.variables import Runner as Inputs
 
 __all__ = ["Pipeline", "Split"]
@@ -40,9 +40,11 @@ class Pipeline:
         self.orchestrator = Orchestrator(
             self.model, ColumnSelector(self.model),
             ExplainerAgent(self.model, check_model, plan_model, split.rulebook, split.calendar, s.explainer_calls,
-                           s.explainer_checks),
+                           s.explainer_checks, mode="fast" if s.p2_mode == "fast" else "loop",
+                           plan_mode=s.plan_mode if s.p2_mode == "fast" else "call", spec_max_tokens=s.spec_max_tokens),
             Coder(self.model), Evaluator(self.model, s.gate), Inputs(split.calendar), split.rulebook,
-            s.max_turns, s.coder_steps, s.explainer_reruns)
+            s.max_turns, s.coder_steps, s.explainer_reruns,
+            use_selector=s.p2_mode != "fast", decide_after_explainer=s.p2_mode != "fast", shared_prefix=s.shared_prefix)
         self._ctx: dict[str, BusinessContext] = {}
         self._ctx_lock = threading.Lock()
 
@@ -66,5 +68,6 @@ class Pipeline:
             line = {"id": q["id"], "type": "abstain"}
         log["answer"] = line
         log["usage"] = get_usage()
+        log["llm_calls"] = get_call_log()
         log["elapsed_s"] = round(time.time() - t0, 2)
         return line, log

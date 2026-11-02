@@ -41,3 +41,16 @@ def test_plumbing_fixes():
     # float-ified month strings
     assert _heuristic("2025.0-10.0") == "date"
     assert format_answer("date", "2025.0-10.0")["answer"] == "2025-10"
+
+
+def test_a_list_returned_as_name_amount_pairs_keeps_the_half_asked_for():
+    # dev300 q_33e8f7506387: the right top 5 with their quantities was refused, the hand-rebuilt ranking was wrong (abstain)
+    from types import SimpleNamespace
+    from datamate.answer.interpreter import interpret
+    pairs = [["Cà phê sữa (M)", 308], ["Trà đào cam sả (M)", 244]]
+    r = interpret(pairs, "list", SimpleNamespace(k=2, measure="quantity", periods=[]))
+    assert (r.kind, r.raw, r.issues) == ("list", ["Cà phê sữa (M)", "Trà đào cam sả (M)"], [])
+    months = [["2025-04", 120], ["2025-05", 150]]                         # one number per month: the numbers
+    assert interpret(months, "list", SimpleNamespace(k=None, measure="money", periods=[])).raw == [120, 150]
+    unclear = interpret(pairs, "list", SimpleNamespace(k=None, measure="money", periods=[]))
+    assert "type" in unclear.issues                                      # names or amounts? the check stays

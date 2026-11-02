@@ -13,15 +13,20 @@ from datetime import date, timedelta
 
 from datamate.text import fold_text
 
+DAY_LAST = re.compile(r"\b(?:hom qua|bua qua|hqua|ngay hom qua)\b")       # §2 "hôm qua" = the day before as_of_date
+DAY_THIS = re.compile(r"\b(?:hom nay|bua nay|hnay|ngay hom nay)\b")
 WEEK_LAST = re.compile(r"\btuan (?:truoc|roi|qua|trc|vua roi|vua qua)\b")
 WEEK_THIS = re.compile(r"\btuan nay\b")
 MONTH_LAST = re.compile(r"\bthang (?:truoc|roi|qua|trc|vua roi)\b")
 MONTH_THIS = re.compile(r"\bthang nay\b")
 MONTH = re.compile(r"\b(?:thang|th|t) ?(\d{1,2}) ?(?:/|-|nam)? ?(20\d{2})?(?!\d)")
 QUARTER = re.compile(r"\b(?:quy|q) ?([1-4]) ?(?:/|-|nam)? ?(20\d{2})?(?!\d)")
+BALANCE = re.compile(r"\bcuoi ngay\b|\bhet hom nay\b|\bhet ngay\b|\bton\b|\bcon no\b|\bdang no\b|\bcon lai\b")
 # questions whose period is not "the whole named span": balances, windows, comparisons
 SKIP = re.compile(r"\bden het\b|\btinh den\b|\btu dau\b|\bso voi\b|\bcung ky\b|\bnhung\b|\bden thang\b|\btu thang\b|\bden ngay\b|"
-                  r"\btu ngay\b|\bke tu\b|\bngay gan nhat\b|\b\d+ ngay\b|\btet\b|\blien truoc\b|\btruoc do\b")
+                  r"\btu ngay\b|\bke tu\b|\bngay gan nhat\b|\b\d+ ngay\b|\btet\b|\blien truoc\b|\btruoc do\b|"
+                  # balances at the end of a day (stock, debt): from the first day of the data to that day, not that day only
+                  r"\bcuoi ngay\b|\bhet hom nay\b|\bhet ngay\b|\bton\b|\bcon no\b|\bdang no\b|\bcon lai\b")
 
 
 def _month_bounds(y: int, m: int) -> tuple[date, date]:
@@ -45,6 +50,11 @@ def calendar_period(question: str, as_of: str) -> tuple[date, date, str] | None:
     today = date.fromisoformat(as_of[:10])
     monday = today - timedelta(days=today.weekday())
     found: list[tuple[date, date, str]] = []
+    # dev300 q_078fecc248e5 "bua qua dthu duoc bao nhieu": the spec read "bữa qua" (yesterday) as last week
+    if DAY_LAST.search(q):
+        found.append((today - timedelta(days=1), today - timedelta(days=1), "yesterday"))
+    if DAY_THIS.search(q):
+        found.append((today, today, "today"))
     if WEEK_LAST.search(q):
         found.append((monday - timedelta(days=7), monday - timedelta(days=1), "last week"))
     if WEEK_THIS.search(q):

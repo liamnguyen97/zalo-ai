@@ -129,7 +129,7 @@ class Evaluator:
                 f"LAST CODE RUN AND ITS RESULT:\n{code}\n\n"
                 + (f"THE CODE CONCLUDED UNANSWERABLE: {raw!r:.300}" if unanswerable
                    else f"ANSWER: {interp.kind} = {interp.raw!r:.300}"))
-        v = _json(chat(self.model, JUDGE_SYSTEM, user))
+        v = _json(chat(self.model, JUDGE_SYSTEM, user, stage="judge", max_tokens=800, context=getattr(st, "context", None)))
         if v is None or v.get("verdict") not in ("accept", "revise", "unanswerable"):
             return Verdict("unanswerable" if unanswerable else "accept", "judge_ignored", feedback="(judge reply unreadable)")
         ev = str(v.get("evidence") or "").strip()

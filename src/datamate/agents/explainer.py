@@ -52,6 +52,9 @@ class Spec:
     assumptions: list[str] = field(default_factory=list)
     engine_call: dict | None = None                       # {"function", "args"}: ONE exact engine call (engines/reference.py)
     missing_fields: list[str] = field(default_factory=list)   # properties the question needs that no column records (§7)
+    unit: str | None = None                               # the unit the answer is asked in ("một thùng" -> "thùng"), fast mode
+    rule_refs: list[str] = field(default_factory=list)    # rulebook row labels; code copies the lines into `rules` (fast mode)
+    method: str = ""                                      # the plan, written in the spec call (DATAMATE_PLAN_MODE=spec)
     status: str = "clear"                                 # clear | unchecked | fallback (for analysis)
     open_issues: list[str] = field(default_factory=list)  # what the checks still reported when the budget ended
 
@@ -534,11 +537,107 @@ def to_state(s: Spec, st) -> None:
     st.period = Resolved(date.fromisoformat(st.as_of[:10]), periods)
 
 
+SYSTEM_FAST = """\
+You are the EXPLAINER in a question-answering system over a shop's data. Your job: UNDERSTAND the question (Vietnamese; it may use
+abbreviations, no diacritics, teen-code, typos) and write ONE SPEC so a programmer can compute the answer WITHOUT guessing.
+Do NOT compute the answer.
+
+""" + LANG_RULE + """
+
+The system has already read the question in code (DATA MATCHES, PERIODS NAMED, ANSWER TYPE READ FROM THE WORDING): use those exact
+spellings and dates unless the question clearly means something else; a reading marked "reliable" is right in ~98% of cases.
+Return ONLY one JSON object, the spec, with these fields:
+  rewritten_question: the question in English, SELF-CONTAINED (names verbatim from the data, dates YYYY-MM-DD, the measure and its unit,
+      which orders count, the answer form); keep EVERY condition of the original question and add none;
+  answer_type: number | percent | string | date | boolean | list | table
+      (one name = string; several names or several numbers in order = list; rows with columns = table; "bao nhiêu"/"mấy" of one quantity
+       = number; "có mấy mặt hàng|khách|đơn" COUNTS = number; "tháng nào/ngày nào" = date);
+  measure: quantity (amount of goods) | money | orders | count (distinct objects) | ratio | name | date | yes_no | other.
+      "bao nhiêu ly/đĩa/phần/thùng" is quantity, NEVER revenue;
+  unit: the unit the answer is asked in ("một thùng" -> "thùng"; "bao nhiêu ly" -> "ly"), else null;
+  answer_form: short description (element order of a list, columns of a table, unit, rounding);
+  k: number of elements for a top-k question, else null;
+  periods: [{"label", "start": "YYYY-MM-DD", "end": "YYYY-MM-DD", "role": "main"|"compare"}]; for a balance "up to the end of day X"
+      main runs from the first day of the data to X; no period: [];
+  entities: [{"value": exact value from DATA MATCHES, "table", "column", "role": item|customer|group|staff|supplier|other}] - only what
+      the QUESTION names, never the answer;
+  tables: {"<table>": ["<column>", ...]} to use (exact names from the SCHEMA; a column lives on the table whose card lists it);
+  rule_refs: the labels of the RULEBOOK rows / sections that decide the computation (e.g. "Giá nhập bình quân một mặt hàng trong
+      tháng"), copied from the rulebook, labels only;
+  engine_call: null or {"function": "<name>", "args": {...}} when ONE available function computes EXACTLY what is asked;
+  answerable: true/false; unanswerable_reason: why, when false (RULEBOOK §7: a property no column records is unanswerable);
+  missing_fields: [Vietnamese names of properties the question needs that NO column records], else [];
+  assumptions: [only interpretation choices the question leaves open, one short line each; never a formula];"""
+
+METHOD_FIELD = """
+  method: the PLAN for the programmer, as numbered steps (as many as the computation needs): the engine function to call, or the tables,
+      joins and filters (period, order status by the rulebook, conditions of the question only), unit conversion, the calculation, the
+      answer form. Revenue / order counts come from `sales_metrics` or `sales_orders.revenue`, NEVER from an order total column; a
+      document's total column covers EVERY item on it (never divide it by one item's quantity). Do not write code."""
+
+FIX_NOTE = ("\n\nYOUR PREVIOUS SPEC (JSON) AND WHAT THE CHECKS FOUND - return the FULL corrected spec, same fields:\n")
+
+
+def rule_lines(refs, rulebook: str, limit: int = 6) -> list[str]:
+    """The rulebook lines a spec refers to by label (a table row "| label | rule |" or a heading). Labels the rulebook does
+    not contain are kept as written: the old `rules` field copied 300-670 characters of rulebook text per spec."""
+    lines = [l.strip() for l in (rulebook or "").splitlines() if l.strip()]
+    out = []
+    for ref in refs if isinstance(refs, list) else []:
+        f = fold_text(str(ref))
+        if len(f) < 4:
+            continue
+        hit = next((l for l in lines if f in fold_text(l)), None)
+        text = hit or str(ref)
+        if text not in out:
+            out.append(text)
+    return out[:limit]
+
+
+def code_checks(s: Spec, facts, question: str) -> tuple[list[str], list[str]]:
+    """(notes: what code fixed, issues: what the model must fix). The model-free stand-ins for the blind type reading and the
+    clarity check, each one tested on the training questions (agents/question.py)."""
+    notes, issues = [], []
+    r = facts.reading
+    if r is not None and r.sure and s.answer_type != r.answer_type:
+        if {s.answer_type, r.answer_type} == {"list", "table"}:
+            issues.append(f"answer_type: the wording reads as {r.answer_type!r} ({r.rule}), the spec says {s.answer_type!r}: "
+                          "check whether the question asks for names only (list) or names with amounts (table)")
+        else:
+            notes.append(f"harness: answer_type {s.answer_type} -> {r.answer_type} (question wording: {r.rule})")
+            s.answer_type = r.answer_type
+    if r is not None and r.k and s.answer_type in ("list", "table") and s.k != r.k:
+        notes.append(f"harness: k {s.k} -> {r.k} (question wording)")
+        s.k = r.k
+    if s.answer_type == "string" and s.k and s.k > 1:
+        notes.append(f"harness: answer_type string -> list (k={s.k})")
+        s.answer_type = "list"
+    # a value the question names (several words: an item, group or customer, not a lone unit) and the spec lost
+    used = fold_text(" ".join([str(e.get("value")) for e in s.entities] + [str(s.rewritten_question or ""), str(s.unit or "")]))
+    for n in facts.names:
+        if n.words >= 2 and fold_text(n.value) not in used and n.phrase not in used:
+            t, c, v = n.hits[0]
+            issues.append(f"entities: the question names {v!r} (`{t}`.`{c}`) but the spec does not use it")
+    # an entity the question does not name (the model filled it from the data or invented it)
+    qn = set(fold_text(question).split()) | set(" ".join(n.phrase for n in facts.names).split())
+    for e in s.entities:
+        w = fold_text(str(e.get("value"))).split()
+        if w and sum(x in qn for x in w) < max(1, (len(w) + 1) // 2):
+            issues.append(f"entities: {e.get('value')!r} is not named by the question; keep only what the question names")
+    # a calendar phrase of the question with no period of the spec covering it
+    for p in facts.periods:
+        if not any(str(x.get("start"))[:10] <= str(p.start) and str(p.end) <= str(x.get("end"))[:10] for x in s.periods):
+            issues.append(f"periods: the question names {p.label} ({p.start}..{p.end}) and no spec period covers it")
+    return notes, issues
+
+
 class ExplainerAgent:
-    def __init__(self, model, check_model, plan_model, rulebook: str, calendar, max_calls: int = 5, max_checks: int = 2):
+    def __init__(self, model, check_model, plan_model, rulebook: str, calendar, max_calls: int = 5, max_checks: int = 2,
+                 mode: str = "loop", plan_mode: str = "call", spec_max_tokens: int = 3000):
         self.model, self.check_model, self.plan_model = model, check_model, plan_model
         self.rulebook, self.calendar = rulebook, calendar
         self.max_calls, self.max_checks = max_calls, max_checks
+        self.mode, self.plan_mode, self.spec_max_tokens = mode, plan_mode, spec_max_tokens   # see run_fast
 
     def _context(self, st, tools: DataTools) -> str:
         return (f"RULEBOOK:\n{self.rulebook}\n\nSHOP README:\n{st.ctx.readme[:6000]}\n\nSCHEMA:\n{st.schema}\n\n"
@@ -548,7 +647,7 @@ class ExplainerAgent:
         """(answer type, quote, measure): an independent reading made WITHOUT seeing the spec. It counts only when its
         quote is really in the question: on holdout6 a reading quoted "tỉ lệ đơn huỷ" for "đếm số đơn đã huỷ" and
         talked the Explainer into a percent."""
-        v = _json(chat(model or self.check_model, TYPE_SYSTEM, f"RULEBOOK:\n{self.rulebook}\n\nQUESTION: {st.question}"))
+        v = _json(chat(model or self.check_model, TYPE_SYSTEM, f"RULEBOOK:\n{self.rulebook}\n\nQUESTION: {st.question}", stage="blind_type", max_tokens=300))
         v = v if isinstance(v, dict) else {}
         t, m, q = v.get("answer_type"), v.get("measure"), str(v.get("quote") or "").strip()
         qw, words = re.findall(r"\w+", fold_text(q)), set(re.findall(r"\w+", fold_text(st.question)))
@@ -561,7 +660,7 @@ class ExplainerAgent:
         and it names a real spec field: a small checker otherwise invents conditions the question never had."""
         user = (f"RULEBOOK:\n{self.rulebook}\n\nSCHEMA:\n{st.schema}\n\nas_of_date = {st.as_of}\n"
                 f"ORIGINAL QUESTION: {st.question}\n\nSPEC:\n{spec_text(s)}")
-        v = _json(chat(self.check_model, CHECK_SYSTEM, user))
+        v = _json(chat(self.check_model, CHECK_SYSTEM, user, stage="clarity", max_tokens=1200))
         if v is None:
             return True, [], []          # a broken check must not block the answer
         where = fold_text(st.question) + " || " + fold_text(s.rewritten_question or "")
@@ -578,6 +677,8 @@ class ExplainerAgent:
     def run(self, st, feedback: str = "") -> Spec:
         """Write the spec (and the plan). `feedback`: why the orchestrator asks for a new spec (an Evaluator verdict that
         the question was misread, with the previous spec), shown to the model with the question."""
+        if self.mode == "fast":
+            return self.run_fast(st, feedback)
         tools = DataTools(st.ctx.tables, self.calendar, getattr(st.ctx, "structure", None))
         base = self._context(st, tools)
         if feedback:
@@ -595,7 +696,7 @@ class ExplainerAgent:
             convo = "\n\n".join(history)[-12000:]
             must = ("\n\nLAST TURN: return only the spec." if i == self.max_calls - 1 else
                     "\n\nThis turn MUST contain a spec (lookups only if truly missing)." if i >= 1 else "")
-            out = _json(chat(self.model, SYSTEM, base + ("\n\nPREVIOUS TURNS:\n" + convo if convo else "") + must))
+            out = _json(chat(self.model, SYSTEM, base + ("\n\nPREVIOUS TURNS:\n" + convo if convo else "") + must, stage="explainer_turn"))
             entry = {"turn": i, "out": out}
             log.append(entry)
             if out is None:
@@ -729,13 +830,101 @@ class ExplainerAgent:
         self.plan(st, s)
         return s
 
+    # ------------------------------------------------------------------ fast mode (DATAMATE_P2=fast)
+    def _fast_prompt(self, st, facts, tools) -> str:
+        """Shared part first (rulebook, README, schema, functions: the same for every question of the shop, so the server's
+        prefix cache serves it), the question's own part last."""
+        have = ", ".join(sorted(k for k in getattr(st, "functions", []) or [])) or "(see ENGINE FUNCTIONS)"
+        shop = ("" if getattr(st, "context", None) else      # shared: already at the start of the system prompt
+                f"RULEBOOK:\n{self.rulebook}\n\nSHOP README:\n{st.ctx.readme[:6000]}\n\nSCHEMA:\n{st.schema}\n\n"
+                f"{ENGINE_NOTE}\nAVAILABLE FUNCTIONS FOR THIS SHOP: {have}\n\n")
+        return (shop + f"{facts.prompt()}\n\nDATE FACTS:\n{date_facts(st.as_of, tools)}\n\n"
+                f"as_of_date = {st.as_of}\nORIGINAL QUESTION: {st.question}")
+
+    def _spec_call(self, system: str, user: str, stage: str, context: str | None = None):
+        out = _json(chat(self.model, system, user, stage=stage, max_tokens=self.spec_max_tokens, context=context))
+        if isinstance(out, dict) and isinstance(out.get("spec"), dict):
+            out = out["spec"]
+        return out if isinstance(out, dict) else None
+
+    def _settle(self, st, raw: dict, tools, facts, anchored: dict) -> tuple[Spec, list[str], list[str], list[str]]:
+        """repair_spec + code checks: (spec, errors, issues for the model, notes)."""
+        s, errs, warns, notes = repair_spec(raw, st.ctx.tables, st.as_of, tools, st.question)
+        notes += keep_anchored(s, anchored, st.question)
+        s.rules = rule_lines(s.rule_refs, self.rulebook) or [str(x) for x in (s.rules or [])]
+        cnotes, issues = code_checks(s, facts, st.question)
+        benign = [e for e in errs if re.match(r"(table '.+' has no columns|no table ')", e)]
+        hard = [e for e in errs if e not in benign]
+        return s, hard, issues, notes + cnotes + [settled(e) for e in benign] + [f"warning: {w}" for w in warns]
+
+    def run_fast(self, st, feedback: str = "") -> Spec:
+        """One spec call, checks in code, at most one fix call (agents/question.py reads the question first).
+
+        Replaces the loop (turns asking for lookups, a blind type reading, one or two clarity checks, a plan call): on the first
+        local runs the loop averaged 1.9 turns but every question still paid 6-8 model calls in this phase (69-74% of its time),
+        and the checks changed nothing on 14 of 17 questions. Each check kept here runs in code; the model is called again only
+        when they find something it must fix (an error repair_spec could not settle, a name the spec lost, an entity the
+        question does not name, a period no spec period covers, a list / table disagreement)."""
+        from datamate.agents.question import read_question
+        tools = DataTools(st.ctx.tables, self.calendar, getattr(st.ctx, "structure", None))
+        facts = read_question(st.question, st.as_of, st.ctx.tables)
+        system = SYSTEM_FAST + (METHOD_FIELD if self.plan_mode == "spec" else "")
+        user = self._fast_prompt(st, facts, tools)
+        if feedback:
+            user += "\n\nTHE PREVIOUS SPEC WAS JUDGED TO MISREAD THE QUESTION (write a new spec, fix exactly this):\n" + feedback
+        log: dict = {"mode": "fast", "plan_mode": self.plan_mode, "facts": facts.as_log(), "calls": []}
+        anchored: dict = {}
+        ctx_text = getattr(st, "context", None)
+        raw = self._spec_call(system, user, "spec", ctx_text)
+        s, errs, issues, notes = (None, [], [], [])
+        if raw is not None:
+            s, errs, issues, notes = self._settle(st, raw, tools, facts, anchored)
+        log["calls"].append({"call": "spec", "out": raw, "errors": errs, "issues": issues, "notes": notes})
+        if raw is None or errs or issues:
+            fix = user + FIX_NOTE + (json.dumps(raw, ensure_ascii=False)[:4000] if raw else "(no JSON object was returned)")
+            if notes:
+                fix += "\nTHE SYSTEM FIXED:\n- " + "\n- ".join(notes)
+            if errs or issues:
+                fix += "\nTO FIX:\n- " + "\n- ".join(errs + issues)
+            raw2 = self._spec_call(system, fix, "spec_fix", ctx_text)
+            entry = {"call": "spec_fix", "out": raw2}
+            if raw2 is not None:
+                s2, errs2, issues2, notes2 = self._settle(st, raw2, tools, facts, anchored)
+                entry.update(errors=errs2, issues=issues2, notes=notes2)
+                if s is None or len(errs2) + len(issues2) <= len(errs) + len(issues):
+                    s, errs, issues, notes = s2, errs2, issues2, notes2
+            log["calls"].append(entry)
+        if s is None:
+            s = Spec(rewritten_question=st.question, status="fallback")
+            r = facts.reading
+            if r is not None:
+                s.answer_type, s.k = r.answer_type, r.k
+        elif errs or issues:
+            s.status, s.open_issues = "unchecked", errs + issues
+        if not str(s.rewritten_question or "").strip():
+            s.rewritten_question = st.question
+        if s.answer_type is None and facts.reading is not None:
+            s.answer_type = facts.reading.answer_type
+        s.assumptions = list(s.assumptions or []) + [n for n in notes if n.startswith("harness:")]
+        log["spec"] = asdict(s)
+        st.log["explainer"] = log
+        to_state(s, st)
+        if self.plan_mode == "spec":
+            st.plan = s.method if isinstance(s.method, str) else "\n".join(f"{i}. {x}" for i, x in enumerate(s.method or [], 1))
+            st.log["plan"] = st.plan
+        elif self.plan_mode == "call":
+            self.plan(st, s)
+        else:
+            st.plan = ""
+        return s
+
     def _forced_spec(self, st, base: str, history: list[str], tools, anchored: dict) -> dict | None:
         """One extra call, lookups closed, asking for the full spec. None when the reply holds no spec."""
         convo = "\n\n".join(history)[-12000:]
         user = (base + ("\n\nPREVIOUS TURNS:\n" + convo if convo else "")
                 + "\n\nFINAL TURN: lookups are closed. Return {\"lookups\": [], \"spec\": {...}} with the FULL spec now, "
                   "fixing every SPEC ERROR and THE SYSTEM FIXED note above. Do not ask for anything else.")
-        out = _json(chat(self.model, SYSTEM, user))
+        out = _json(chat(self.model, SYSTEM, user, stage="explainer_forced"))
         if not isinstance(out, dict) or not isinstance(out.get("spec"), dict):
             return None
         s, errs, warns, notes = repair_spec(out["spec"], st.ctx.tables, st.as_of, tools, st.question)
@@ -745,5 +934,5 @@ class ExplainerAgent:
     def plan(self, st, s: Spec) -> None:
         user = (f"RULEBOOK:\n{self.rulebook}\n\nSHOP README:\n{st.ctx.readme[:6000]}\n\nSCHEMA:\n{st.schema}\n\n"
                 f"{ENGINE_NOTE}\n\nas_of_date = {st.as_of}\nORIGINAL QUESTION: {st.question}\nSPEC:\n{spec_text(s)}")
-        st.plan = re.sub(r"<think>.*?</think>", "", chat(self.plan_model, PLAN_SYSTEM, user), flags=re.S).strip()
+        st.plan = re.sub(r"<think>.*?</think>", "", chat(self.plan_model, PLAN_SYSTEM, user, stage="plan"), flags=re.S).strip()
         st.log["plan"] = st.plan

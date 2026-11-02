@@ -99,7 +99,10 @@ def _run(args) -> None:
                      "thinking_max_tokens": settings.thinking_max_tokens,
                      "explainer_calls": settings.explainer_calls, "explainer_checks": settings.explainer_checks,
                      "providers": settings.openrouter_providers,
-                     "structure_cards": os.getenv("DATAMATE_STRUCTURE_CARDS", "1")},
+                     "structure_cards": os.getenv("DATAMATE_STRUCTURE_CARDS", "1"),
+                     "purchase_engine": os.getenv("DATAMATE_PURCHASE_ENGINE", "1"),
+                     "p2_mode": settings.p2_mode, "plan_mode": settings.plan_mode, "spec_max_tokens": settings.spec_max_tokens,
+                     "shared_prefix": settings.shared_prefix},
         "filters": {"limit": args.limit, "business": args.business},
         **summarize(log_dir, out, gold if gold.exists() else None),
     }

@@ -25,6 +25,7 @@ from datamate.answer.interpreter import as_count, interpret
 from datamate.engines.functions import TOOL_NAMES
 from datamate.data.onboarding import summary
 from datamate.agents.coverage import no_identified_customers, period_outside_data
+from datamate.agents.shared import shared_context
 from datamate.engines.reference import agrees, build_reference
 from datamate.engines.routing import route
 from datamate.llm import chat
@@ -79,10 +80,16 @@ def spec_summary(s) -> str:
 
 class Orchestrator:
     def __init__(self, model, col_selector, explainer, coder: Coder, evaluator: Evaluator, inputs, rulebook: str,
-                 max_turns: int = 3, coder_steps: int = 6, explainer_reruns: int = 1):
+                 max_turns: int = 3, coder_steps: int = 6, explainer_reruns: int = 1,
+                 use_selector: bool = True, decide_after_explainer: bool = True, shared_prefix: bool = False):
         self.model, self.col_selector, self.explainer, self.coder, self.evaluator = model, col_selector, explainer, coder, evaluator
         self.inputs, self.rulebook = inputs, rulebook
         self.max_turns, self.coder_steps, self.explainer_reruns = max_turns, coder_steps, explainer_reruns
+        # fast P2 (config.p2_mode): no Column Selector (it only re-ordered the cards: 94-109% of the full schema on small shops),
+        # no model decision after the spec (3 of 17 local questions re-ran the Explainer there; on biz_124 it claimed
+        # "August 2025 is in the future" of 2026-05-25 and turned a right engine value into a wrong "unanswerable")
+        self.use_selector, self.decide_after_explainer = use_selector, decide_after_explainer
+        self.shared_prefix = shared_prefix          # agents/shared.py: the shop's context opens every call
 
     # ------------------------------------------------------------------ bookkeeping
     def _call(self, st, agent: str, fn, **info):
@@ -103,7 +110,7 @@ class Orchestrator:
             user = (f"ORIGINAL QUESTION: {st.question}\nas_of_date = {st.as_of}\n\nSPEC:\n{spec_summary(st.brief)}\n\n"
                     f"TURNS SO FAR:\n{history}\n\nDECISION POINT: {point}\nALLOWED ACTIONS: {allowed} "
                     f"(default: {default})")
-            v = _json(chat(self.model, SYSTEM, user))
+            v = _json(chat(self.model, SYSTEM, user, stage="orchestrator", max_tokens=500, context=getattr(st, "context", None)))
             if v and v.get("action") in allowed:
                 d = Decision(v["action"], str(v.get("message") or "")[:600], str(v.get("reason") or "")[:300])
             else:
@@ -116,11 +123,24 @@ class Orchestrator:
     def run(self, st) -> dict:
         st.log["orchestrator"], turns = [], []
         st.log["turns"] = turns
-        self._call(st, "column_selector", lambda: self.col_selector.run(st))
+        if self.use_selector:
+            self._call(st, "column_selector", lambda: self.col_selector.run(st))
+        else:
+            st.tables, st.selection, st.schema = st.ctx.tables, {}, st.ctx.schema
+        try:   # the functions this shop has, named in the spec prompt (fast mode)
+            st.functions = sorted(k for k, v in self.inputs.tools(st.ctx).items() if callable(v) and k in TOOL_NAMES)
+        except Exception:  # noqa: BLE001
+            st.functions = []
+        st.context = (shared_context(self.rulebook, st.ctx.readme, st.schema, st.functions) if self.shared_prefix else None)
         self._call(st, "explainer", lambda: self.explainer.run(st))
         reruns = self.explainer_reruns
-        d = self.decide(st, "after_explainer: use this spec or rewrite it?", ["coder"] + (["explainer"] if reruns else []),
-                        "coder", turns)
+        if self.decide_after_explainer:
+            d = self.decide(st, "after_explainer: use this spec or rewrite it?", ["coder"] + (["explainer"] if reruns else []),
+                            "coder", turns)
+        else:
+            d = Decision("coder", by="rule", reason="fast P2: no decision after the spec")
+            st.log["orchestrator"].append({"decide": "after_explainer", "allowed": ["coder"], "action": "coder", "by": "rule",
+                                           "message": "", "reason": d.reason})
         feedback = ""
         if d.action == "explainer":
             reruns -= 1
@@ -203,7 +223,7 @@ class Orchestrator:
         for _ in range(self.coder_steps):
             # a block that repeats an earlier one at temperature 0 can only fail the same way: the next call is sampled
             temp = REPEAT_TEMPERATURE if repeats else None
-            code = self._call(st, "coder", lambda: self.coder.write(task, steps, feedback, temperature=temp), turn=turn,
+            code = self._call(st, "coder", lambda: self.coder.write(task, steps, feedback, temperature=temp, context=getattr(st, "context", None)), turn=turn,
                               **({"temperature": temp} if temp else {}))
             if not code:
                 steps.append(RunResult(code="", error="No code block found: reply with exactly one ```python ... ``` block"))

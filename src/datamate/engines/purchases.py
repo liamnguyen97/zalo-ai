@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from datamate.data.status import add_status_std
+from datamate.data.status import STATUS_COL, classify
 from datamate.text import fold
 
 PURCHASE_NAME = re.compile(r"nh[ậa]p|nhap|purchase|import|receiv", re.I)
@@ -86,14 +86,18 @@ def _cn(c) -> str:
 
 
 def _valid(df: pd.DataFrame) -> np.ndarray:
-    """Slips that count: not cancelled / returned (an unknown or missing status counts)."""
-    try:
-        d = add_status_std(df)
-    except Exception:  # noqa: BLE001
-        return np.ones(len(df), bool)
-    if "status_std" not in d.columns:
-        return np.ones(len(df), bool)
-    return ~d["status_std"].isin(["cancelled", "returned"]).to_numpy()
+    """Slips that count: a slip whose status column says cancelled (or returned) does not (rulebook §5). Only labels the status
+    rules recognise as cancelled are left out: 'Đã nhập hàng' / 'received' or a missing status count. (`add_status_std` is
+    not used: it keeps a status column only when >= 90% of its labels are recognised, and 'Đã nhập hàng' is not one.)"""
+    ok = np.ones(len(df), bool)
+    for c in df.columns:
+        if df[c].dtype.kind in "iufbM" or not STATUS_COL.search(str(c)):
+            continue
+        vals = df[c].dropna().astype(str).unique()
+        bad = {v for v in vals if len(vals) <= 40 and classify(v) in ("cancelled", "returned")}
+        if bad:
+            ok &= ~df[c].astype(str).isin(bad).to_numpy()
+    return ok
 
 
 def _date_col(df: pd.DataFrame, hi) -> str | None:
