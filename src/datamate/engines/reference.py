@@ -10,9 +10,12 @@ one retry: a Coder that still disagrees after seeing it is trusted (the Explaine
 from __future__ import annotations
 
 import inspect
+import numbers
 import re
 from dataclasses import dataclass
 from typing import Any
+
+import numpy as np
 
 from datamate.text import fold
 
@@ -97,6 +100,34 @@ def agrees(ref: Reference, raw: Any) -> bool:
         if isinstance(raw, (list, tuple)) and len(raw) == len(v) and all(_num(x) is not None for x in raw):
             return all(_same_number(float(x), float(y)) for x, y in zip(v, raw))
     return True
+
+
+def _real(x) -> float | None:
+    """A plain or numpy number as float (numpy integers are not `int`); None for anything else, booleans included."""
+    return float(x) if isinstance(x, numbers.Real) and not isinstance(x, (bool, np.bool_)) else None
+
+
+def confirms(ref: Reference, raw: Any) -> bool:
+    """True only when the value has a shape the reference can be compared with AND equals it. `agrees` lets through the shapes it
+    cannot compare (it decides a doubt); this decides that no judge is needed, so anything unsure is False. A dict of several
+    metrics (`sales_metrics`) never confirms: the whole-shop figures ignore conditions such as channel, shift or cancelled orders
+    (as a routing hint they were right on 64 of 91 dev300 questions against the Coder's 88)."""
+    v = ref.value
+    if isinstance(v, dict) and "pct" in v:
+        v = v["pct"]
+    if (a := _real(v)) is not None:
+        b = _real(raw)
+        return b is not None and _same_number(a, b)
+    if (names := _names(v)) is not None:
+        if isinstance(raw, str):
+            return len(names) == 1 and fold(raw) == names[0]
+        if isinstance(raw, (list, tuple)) and raw and all(isinstance(x, str) for x in raw):
+            return [fold(x) for x in raw] == names
+        return False
+    if isinstance(v, (list, tuple)) and v and all(_real(x) is not None for x in v):
+        return (isinstance(raw, (list, tuple)) and len(raw) == len(v) and all(_real(x) is not None for x in raw)
+                and all(_same_number(_real(x), _real(y)) for x, y in zip(v, raw)))
+    return False
 
 
 def reference_note(ref: Reference) -> str:

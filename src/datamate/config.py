@@ -95,6 +95,19 @@ class Settings:
     guideline_rows: int = field(default_factory=lambda: int(os.getenv("DATAMATE_GUIDELINE_ROWS", "4")))
     verified_facts: bool = field(default_factory=lambda: _flag("DATAMATE_VERIFIED_FACTS", True))
 
+    # P4 / P5 (ledger #12). After a rejected turn: "rule" = a rule table on the verdicts picks coder / explainer / abstain (no model
+    # call), "model" = the orchestrator model picks, as before (the rule's choice is logged as `rule_would`). No judge call when the
+    # value equals an exact engine function's: OFF by default (dev300: -1 question for ~0.4% of the time). A value the judge
+    # rejected and the Coder returned unchanged is accepted. An UNANSWERABLE the code concluded is submitted without the judge
+    # (dev300: PA 0.840 -> 0.857 on the same trajectories). The judge reads the VERIFIED FACTS and the engine value. The code audits
+    # (answer/audit.py: entity named by the question absent from the code, profit larger than revenue): off | shadow | on.
+    decide_mode: str = field(default_factory=lambda: os.getenv("DATAMATE_DECIDE", "rule"))
+    skip_judge_on_engine: bool = field(default_factory=lambda: _flag("DATAMATE_SKIP_JUDGE_ON_ENGINE", False))
+    trust_repeat: bool = field(default_factory=lambda: _flag("DATAMATE_TRUST_REPEAT", True))
+    judge_unanswerable: bool = field(default_factory=lambda: _flag("DATAMATE_JUDGE_UNANSWERABLE", False))
+    judge_facts: bool = field(default_factory=lambda: _flag("DATAMATE_JUDGE_FACTS", True))
+    audit_mode: str = field(default_factory=lambda: os.getenv("DATAMATE_AUDIT", "shadow"))
+
     workers: int = field(default_factory=lambda: int(os.getenv("DATAMATE_WORKERS", "4")))
 
     @property

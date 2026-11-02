@@ -138,12 +138,15 @@ def test_first_turn_accepted():
 
 
 def test_a_rejected_turn_returns_to_the_coder_with_the_reason():
+    # DATAMATE_DECIDE=model: the model decides and its message reaches the Coder; the rule's choice is logged next to it
     m = Scripted(code=[ZERO, RIGHT], orch=[{"action": "coder"}, {"action": "coder", "message": "lọc đúng tên trong ĐẦU VÀO"}])
     st = _st()
-    assert _orch(m).run(st) == {"type": "number", "answer": 2}
+    assert _orch(m, decide_mode="model").run(st) == {"type": "number", "answer": 2}
     second = m.prompts("code")[1]
     assert "the result is 0" in second and "lọc đúng tên trong ĐẦU VÀO" in second
     assert [t["verdict"]["source"] for t in st.log["turns"]] == ["checks", "judge"]
+    after = [e for e in st.log["orchestrator"] if str(e.get("decide", "")).startswith("after_evaluator")]
+    assert after[0]["by"] == "model" and after[0]["rule_would"] == "coder"
 
 
 def test_three_rejected_turns_abstain_and_respect_the_budgets():
@@ -168,7 +171,7 @@ def test_explainer_rerun_is_offered_once():
     m = Scripted(code=[RIGHT], judge=[judge], orch=[{"action": "coder"}, {"action": "explainer", "message": "đọc lại"},
                                                    {"action": "explainer"}])
     st = _st()
-    assert _orch(m, max_turns=3).run(st) == {"type": "abstain"}
+    assert _orch(m, max_turns=3, decide_mode="model", trust_repeat=False).run(st) == {"type": "abstain"}
     decides = [e for e in st.log["orchestrator"] if "decide" in e]
     assert "explainer" in decides[1]["allowed"] and "explainer" not in decides[2]["allowed"]
     assert decides[2]["action"] == "explainer" or decides[2]["by"] == "default"
@@ -179,7 +182,7 @@ def test_explainer_rerun_is_offered_once():
 def test_orchestrator_may_abstain_after_a_rejection():
     m = Scripted(code=[ZERO], orch=[{"action": "coder"}, {"action": "abstain", "reason": "cùng một lỗi"}])
     st = _st()
-    assert _orch(m).run(st) == {"type": "abstain"} and len(st.log["turns"]) == 1
+    assert _orch(m, decide_mode="model").run(st) == {"type": "abstain"} and len(st.log["turns"]) == 1
 
 
 def test_counted_names_become_the_count():
@@ -554,3 +557,165 @@ def test_an_interpreter_error_rejects_the_turn_not_the_question(monkeypatch):
     st = _st()
     assert _orch(m).run(st) == {"type": "number", "answer": 2}
     assert any("interpreter_error" in e for e in st.log["orchestrator"]) and len(st.log["turns"]) == 2
+
+
+# ------------------------------------------------------------------ P4 / P5 (ledger #12): rule table, trusted repeat, no judge on engine
+def _t(source, target="coder", issues=()):
+    return {"verdict": {"source": source, "decision": "revise", "target": target}, "issues": list(issues)}
+
+
+def test_the_rule_table_after_a_rejected_turn():
+    from datamate.agents.orchestrator import NO_ANSWER_TWICE, decide_by_rule
+    both, no_rerun = ["coder", "abstain", "explainer"], ["coder", "abstain"]
+    first = decide_by_rule([_t("checks", issues=["zero"])], both)
+    assert (first.action, first.by, first.message) == ("coder", "rule", "")                  # no free text from a model
+    assert decide_by_rule([_t("checks", issues=["zero"]), _t("checks", issues=["type"])], both).action == "coder"
+    twice = [_t("checks", issues=["walk_in"]), _t("checks", issues=["walk_in"])]
+    d = decide_by_rule(twice, both)
+    assert d.action == "explainer" and "walk_in" in d.message                              # the Coder cannot fix it: the spec
+    assert decide_by_rule(twice, no_rerun).action == "abstain"
+    assert decide_by_rule([_t("no_answer")], both).action == "coder"
+    assert decide_by_rule([_t("no_answer"), _t("no_answer")], both).message == NO_ANSWER_TWICE
+    assert decide_by_rule([_t("no_answer"), _t("no_answer")], no_rerun).action == "coder"
+    assert decide_by_rule([_t("judge", "explainer")], both).action == "explainer"
+    assert decide_by_rule([_t("judge", "explainer")], no_rerun).action == "coder"
+    assert decide_by_rule([_t("judge", "coder"), _t("judge", "coder")], both).action == "coder"
+
+
+def test_rule_mode_asks_no_model_after_a_rejected_turn():
+    # the first reply is the legacy decision after the spec; the second would be the model's after the rejected turn
+    m = Scripted(code=[ZERO, RIGHT], orch=[{"action": "coder"}, {"action": "abstain", "message": "lời nhắn của model"}])
+    st = _st()
+    assert _orch(m).run(st) == {"type": "number", "answer": 2}
+    assert len(m.prompts("orch")) == 1                                   # only the legacy decision after the spec
+    after = [e for e in st.log["orchestrator"] if str(e.get("decide", "")).startswith("after_evaluator")]
+    assert len(after) == 1 and after[0]["by"] == "rule" and after[0]["action"] == "coder" and "rule_would" not in after[0]
+    second = m.prompts("code")[1]
+    assert "the result is 0" in second and "lời nhắn của model" not in second
+
+
+def test_a_value_the_judge_rejected_and_the_coder_returned_unchanged_is_accepted():
+    # dev5-coderphase2 q_33e8f7506387: the right top 5 rejected three times by the judge, the question abstained
+    judge = {"verdict": "revise", "target": "coder", "evidence": "bn cai", "problem": "đếm sai"}
+    m = Scripted(code=[RIGHT], judge=[judge])
+    st = _st()
+    assert _orch(m).run(st) == {"type": "number", "answer": 2}
+    assert [t["verdict"]["source"] for t in st.log["turns"]] == ["judge", "repeat_after_veto"]
+    assert len(m.prompts("judge")) == 1                                  # the judge is heard once
+    m2 = Scripted(code=[RIGHT], judge=[judge])
+    st2 = _st()
+    assert _orch(m2, trust_repeat=False).run(st2) == {"type": "abstain"}  # switch off: the old behaviour
+    assert len(m2.prompts("judge")) == 3 and any(e.get("repeat_after_veto") for e in st2.log["orchestrator"])   # still logged
+
+
+def test_no_judge_when_the_value_equals_an_exact_engine_function():
+    from datamate.answer.evaluator import JUDGE_SYSTEM
+    call = {"function": "debt_repaid", "args": {"start": "2026-05-01", "end": "2026-05-31"}}
+    right = "```python\nanswer = debt_repaid(period_start, period_end)\n```"
+    m = Scripted(code=[right], explain=[{"spec": {**SPEC, "engine_call": call}}])
+    o = _orch(m, skip_judge_on_engine=True)
+    o.inputs = _Tools()
+    st = _st()
+    assert o.run(st) == {"type": "number", "answer": 7}
+    assert st.log["turns"][0]["verdict"]["source"] == "engine_agrees" and not m.prompts("judge")
+    m2 = Scripted(code=[right], explain=[{"spec": {**SPEC, "engine_call": call}}])
+    o2 = _orch(m2)                                                        # off by default since the dev300 measurement
+    o2.inputs = _Tools()
+    st2 = _st()
+    assert o2.run(st2) == {"type": "number", "answer": 7} and len(m2.prompts("judge")) == 1
+    assert any(e.get("engine_confirms") for e in st2.log["orchestrator"])   # logged with the switch off too
+    assert "ENGINE VALUE" in m2.prompts("judge")[0] and "debt_repaid(" in m2.prompts("judge")[0]
+    # the routing hint counts as well; a value the engine does not confirm still goes to the judge
+    m3 = Scripted(code=[RIGHT])
+    o3 = _orch(m3, skip_judge_on_engine=True)
+    o3.inputs = _Hinted()                                                 # item_qty -> 2.0, the Coder counts 2
+    st3 = _st()
+    assert o3.run(st3) == {"type": "number", "answer": 2} and st3.log["turns"][0]["verdict"]["source"] == "engine_agrees"
+    assert "Check only" in JUDGE_SYSTEM and "never ask to add amounts" in JUDGE_SYSTEM and "(5)" not in JUDGE_SYSTEM
+
+
+def test_confirms_is_strict_where_agrees_is_lenient():
+    import numpy as np
+    from datamate.engines.reference import Reference, agrees, confirms
+    num = Reference({"function": "debt_repaid", "args": {}}, 3118333)
+    assert confirms(num, 3118333) and confirms(num, 3118333.4) and confirms(num, np.int64(3118333))
+    assert not confirms(num, 4143333) and agrees(num, "abc") and not confirms(num, "abc")
+    top = Reference({"function": "top_items", "args": {"k": 3}}, [("A", 9.0), ("B", 7.0), ("C", 5.0)])
+    assert confirms(top, ["A", "B", "C"]) and not confirms(top, ["B", "A", "C"])
+    assert agrees(top, ["A", "B"]) and not confirms(top, ["A", "B"])          # a prefix is not the same top 3
+    assert agrees(top, 12) and not confirms(top, 12)
+    assert confirms(Reference({"function": "top_customers", "args": {}}, [("An", 100)]), "an")
+    metrics = Reference({"function": "sales_metrics", "args": {}}, {"revenue": 1000, "orders": 4, "avg_order": 250})
+    assert agrees(metrics, 250) and not confirms(metrics, 250)               # whole-shop figures ignore the question's conditions
+    assert confirms(Reference({"function": "item_qty_change", "args": {}}, {"before": 10, "after": 12, "pct": 20.0}), 20.0)
+
+
+def test_an_unanswerable_the_code_concluded_is_submitted_without_the_judge():
+    # dev300 v3.5: 2 of the 3 questions the review damaged were a right UNANSWERABLE it sent back (ledger #12)
+    st, steps = _st(), [RunResult(code="answer = 'UNANSWERABLE: x'", answered=True, value="UNANSWERABLE: x")]
+    it, line = Interpretation("unanswerable", "UNANSWERABLE: x"), {"type": "unanswerable", "reason": "x"}
+    m = Scripted(judge=[{"verdict": "revise", "evidence": "bn cai", "problem": "có dữ liệu"}])
+    v = Evaluator(m).evaluate(st, "C", steps, True, "UNANSWERABLE: x", it, line)
+    assert (v.decision, v.source) == ("unanswerable", "unanswerable_direct") and not m.prompts("judge")
+    m2 = Scripted(judge=[{"verdict": "revise", "evidence": "bn cai", "problem": "có dữ liệu"}])
+    v2 = Evaluator(m2, judge_unanswerable=True).evaluate(st, "C", steps, True, "UNANSWERABLE: x", it, line)
+    assert v2.decision == "revise" and len(m2.prompts("judge")) == 1           # DATAMATE_JUDGE_UNANSWERABLE=1: the old way
+    # end to end: the Runner asks for evidence once, then the conclusion is submitted
+    first = "```python\nprint(list(tables))\nanswer = 'UNANSWERABLE: no such column'\n```"
+    again = "```python\nprint(tables['don'].columns.tolist())\nanswer = 'UNANSWERABLE: no such column'\n```"
+    m3 = Scripted(code=[first, again])
+    st3 = _st()
+    got = _orch(m3).run(st3)
+    assert got["type"] == "unanswerable" and st3.log["turns"][0]["verdict"]["source"] == "unanswerable_direct"
+    assert not m3.prompts("judge")
+
+
+def test_the_judge_reads_the_verified_facts_and_may_quote_them():
+    st, steps = _st(), [RunResult(code="answer = n", output="2", answered=True, value=2)]
+    st.facts = "# VERIFIED FACTS (counted by the system from the data; counts, not the answer)\n- tháng 5: 1 valid orders.\n\n"
+    it, line = Interpretation("number", 2), {"type": "number", "answer": 2}
+    judge = {"verdict": "revise", "evidence": "1 valid orders", "problem": "2 lớn hơn số đơn hợp lệ"}
+    m = Scripted(judge=[judge])
+    v = Evaluator(m).evaluate(st, "C", steps, True, 2, it, line)
+    assert "VERIFIED FACTS" in m.prompts("judge")[0] and v.decision == "revise" and v.source == "judge"
+    assert v.found_in == "facts"                                              # logged: quotes from FACTS widen the filter
+    m2 = Scripted(judge=[judge])
+    v2 = Evaluator(m2, judge_facts=False).evaluate(st, "C", steps, True, 2, it, line)
+    assert "VERIFIED FACTS" not in m2.prompts("judge")[0] and v2.source == "judge_ignored"   # evidence nowhere to be found
+
+
+def test_the_code_audits():
+    from datamate.answer.audit import entity_absent, profit_bound, string_literals
+    natri = ("mask = joined['Hoạt chất'].str.lower().str.contains('natri|clor', na=False)\n"
+             "print(f'Total revenue for Natri Clorid: {answer}')\nprint('Natri clorid')")
+    assert "natri clorid" not in string_literals(natri)                       # f-strings and print() only echo the name
+    spec = SimpleNamespace(entities=[{"value": "Natri clorid", "role": "item"}])
+    assert entity_absent(spec, [natri]) == ["Natri clorid"]                  # dev300 q_0f6233b739e9
+    assert entity_absent(spec, ["d = df[df['Hoạt chất'] == 'Natri clorid']"]) == []
+    assert entity_absent(spec, ["x = (", "d = df[df['Hoạt chất'] == 'natri clorid']"]) == []   # a broken block hides nothing
+    assert entity_absent(SimpleNamespace(entities=[]), [natri]) == [] and entity_absent(spec, []) == []
+    v = {"sales_metrics": lambda s, e: {"revenue": 314535600, "orders": 2795, "avg_order": 112535},
+         "period_start": pd.Timestamp("2025-01-01"), "period_end": pd.Timestamp("2025-01-31 23:59:59")}
+    q = "Xem giúp trừ hết chi phí rồi thì tháng 1/2025 còn lãi ròng bao nhiêu?"   # dev300 q_40de33fe6cdc, gold -62,275,893
+    assert "larger in size" in profit_bound(q, "number", -2292011721, v)
+    assert profit_bound(q, "number", -62275893, v) == "" and profit_bound(q, "percent", -2292011721, v) == ""
+    assert profit_bound("thang 1 lai rong bao nhieu", "number", 5e9, v)        # no diacritics
+    assert profit_bound("tháng 1 còn lại bao nhiêu tiền hàng", "number", 5e9, v) == ""   # "còn lại" is not "còn lãi"
+
+
+def test_audits_are_logged_in_shadow_and_said_once_when_on():
+    substr = "```python\nd = tables['don']\nn = int(d['Tên hàng'].str.contains('tiramisu').sum())\nanswer = n\n```"
+    m = Scripted(code=[substr])
+    st = _st()
+    assert _orch(m).run(st) == {"type": "number", "answer": 2}                # shadow (default): decides nothing
+    t = st.log["turns"][0]
+    assert t["audit"] == {"entity_absent": ["Bánh tiramisu"]} and t["verdict"]["source"] == "judge"
+    m2 = Scripted(code=[substr])
+    st2 = _st()
+    assert _orch(m2, audit_mode="on").run(st2) == {"type": "number", "answer": 2}
+    assert [t["verdict"]["source"] for t in st2.log["turns"]] == ["checks", "judge"]   # sent back once, then trusted
+    assert "Bánh tiramisu" in st2.log["turns"][0]["verdict"]["feedback"]
+    m3 = Scripted(code=[substr])
+    st3 = _st()
+    _orch(m3, audit_mode="off").run(st3)
+    assert "audit" not in st3.log["turns"][0]

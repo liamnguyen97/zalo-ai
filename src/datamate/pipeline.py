@@ -42,10 +42,12 @@ class Pipeline:
             ExplainerAgent(self.model, check_model, plan_model, split.rulebook, split.calendar, s.explainer_calls,
                            s.explainer_checks, mode="fast" if s.p2_mode == "fast" else "loop",
                            plan_mode=s.plan_mode if s.p2_mode == "fast" else "call", spec_max_tokens=s.spec_max_tokens),
-            Coder(self.model), Evaluator(self.model, s.gate), Inputs(split.calendar), split.rulebook,
+            Coder(self.model), Evaluator(self.model, s.gate, s.judge_unanswerable, s.judge_facts), Inputs(split.calendar),
+            split.rulebook,
             s.max_turns, s.coder_steps, s.explainer_reruns,
             use_selector=s.p2_mode != "fast", decide_after_explainer=s.p2_mode != "fast", shared_prefix=s.shared_prefix,
-            guideline_rows=s.guideline_rows, verified_facts=s.verified_facts)
+            guideline_rows=s.guideline_rows, verified_facts=s.verified_facts, decide_mode=s.decide_mode,
+            skip_judge_on_engine=s.skip_judge_on_engine, trust_repeat=s.trust_repeat, audit_mode=s.audit_mode)
         self._ctx: dict[str, BusinessContext] = {}
         self._ctx_lock = threading.Lock()
 

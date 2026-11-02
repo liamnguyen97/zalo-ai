@@ -102,7 +102,11 @@ def _run(args) -> None:
                      "structure_cards": os.getenv("DATAMATE_STRUCTURE_CARDS", "1"),
                      "purchase_engine": os.getenv("DATAMATE_PURCHASE_ENGINE", "1"),
                      "p2_mode": settings.p2_mode, "plan_mode": settings.plan_mode, "spec_max_tokens": settings.spec_max_tokens,
-                     "shared_prefix": settings.shared_prefix},
+                     "shared_prefix": settings.shared_prefix, "guideline_rows": settings.guideline_rows,
+                     "verified_facts": settings.verified_facts, "decide_mode": settings.decide_mode,
+                     "skip_judge_on_engine": settings.skip_judge_on_engine, "trust_repeat": settings.trust_repeat,
+                     "judge_unanswerable": settings.judge_unanswerable, "judge_facts": settings.judge_facts,
+                     "audit_mode": settings.audit_mode},
         "filters": {"limit": args.limit, "business": args.business},
         **summarize(log_dir, out, gold if gold.exists() else None),
     }

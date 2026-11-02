@@ -136,6 +136,7 @@ class QAState:
     stop_reason: str = ""           # why the Coder <-> Runner loop of the current turn ended early (stuck), else ""
     guideline: list = field(default_factory=list)   # agents/guideline.Entry: rulebook rows for this question, before OUTPUT
     facts: str = ""                 # VERIFIED FACTS: counts computed from the data for this question's periods / values
+    audit: dict = field(default_factory=dict)       # answer/audit.py: the code audits that fired on the current turn
 
     @property
     def question(self) -> str:
