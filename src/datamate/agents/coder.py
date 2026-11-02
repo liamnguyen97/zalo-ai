@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 
+from datamate.agents.guideline import render as render_guideline
 from datamate.engines.reference import reference_note
 from datamate.engines.routing import hint_note
 from datamate.llm import chat
@@ -44,6 +45,8 @@ RESOLVED INPUTS, CALCULATION RULES, NOTES, PLAN and OUTPUT (the required answer 
 - Debt (§4): `debt_total(day, older_than_days=None)`, `debt_by_customer(day, k=None)` -> [(name, owed)], `debt_customers(day)`,
   `debt_aging(day, edges=(7, 15))` -> [0-7, 8-15, >15], `debt_repaid(start, end, customer=None)`, `debt_new(start, end, customer=None)`.
 - Customers (§3): `top_customers(k, start, end)` -> [(customer name, revenue)], walk-in customers already removed.
+- Cancel rate (§1, when listed): `cancel_rate(start, end)` -> % of the orders placed in the period that are cancelled, 2 decimals
+  (the denominator is EVERY order of the period, every status).
 - Purchases (§5, when listed under AVAILABLE FUNCTIONS): `purchase_total(start, end)` = money of the purchase slips dated in the period
   (cancelled left out); `purchase_avg_price(item, start, end, unit)` = average import price per `unit` (e.g. 'thùng'), weighted by the
   quantity bought; `top_supplier(start, end, k=1)` -> [(supplier, money)]. A slip's total column covers every item on the slip:
@@ -103,6 +106,7 @@ that quantity; a function cannot take extra conditions: then use `sales_orders` 
   stay) and sends back what it printed or the error. A block that assigns `answer = ...` ends the turn.
 - Budget: at most 6 blocks. Write code that COMPUTES the answer from the FIRST block (with a few short `print`s to check).
   If a block failed, change the approach instead of resending the same code.
+- Keep comments SHORT: at most one short line per step, no restating of the task or the rules (every word you write costs time).
 - Do NOT re-assign `tables`, `calendar`, `period_*` / `compare_*` or the engine functions; do not create sample data.
 - Parenthesize masks `df[(a) & (b)]`; compare datetime columns with pd.Timestamp; never print a whole table; no `__x__`
   attributes. Always start with `import pandas as pd`.
@@ -128,6 +132,17 @@ MEASURE_HINT = {
 }
 
 
+# A list answer is names only or numbers only: 193 list answers in the training gold, none with a [name, amount] element. The
+# spec's free-text `answer_form` said "each containing the item name and the total quantity sold" on 3 of 4 local runs of dev300
+# q_33e8f7506387 (top 5); the judge enforced it and rejected the right names three times (abstain).
+LIST_RULE = ("Rulebook §9: a list holds ONLY the values asked, the names (a top k, which items / customers) OR the numbers in the "
+             "order asked; never [name, amount] pairs or dicts. This rule wins over any other description of the form.")
+PAIR_FORM = re.compile(
+    r"\b(?:pairs?|tuples?|dict(?:ionar(?:y|ies))?|key-value)\b|\beach (?:containing|with|having|including|showing)\b|"
+    r"\b(?:names?|items?|products?|customers?|staff)\b[^.;]{0,40}\b(?:and|with|plus|along with|together with)\b[^.;]{0,30}"
+    r"\b(?:quantit(?:y|ies)|qty|amounts?|revenue|values?|totals?|counts?|sales|money)\b", re.I)
+
+
 def _period_lines(s, period) -> list[str]:
     """Each spec period with the sandbox variable that already holds it (only main + first compare have variables)."""
     out, has_var = [], {"main": "period_start .. period_end", "compare": "compare_start .. compare_end"}
@@ -140,9 +155,10 @@ def _period_lines(s, period) -> list[str]:
     return out
 
 
-def coder_brief(s) -> str:
+def coder_brief(s, rules: bool = True) -> str:
     """The Explainer's checked spec as the sections of the Coder's task (TASK .. OUTPUT). The spec's JSON stays for the
-    Explainer's own check and plan; the Coder gets each part where it is used, the output contract last."""
+    Explainer's own check and plan; the Coder gets each part where it is used, the output contract last. `rules=False`: the
+    spec's rulebook rows are shown in the GUIDELINE section instead (agents/guideline.py)."""
     model_notes = [a for a in s.assumptions or [] if not str(a).startswith("harness:")]
     harness_notes = [str(a).removeprefix("harness:").strip() for a in s.assumptions or [] if str(a).startswith("harness:")]
     ents = [f"- {e.get('role') or 'value'}: `{e.get('value')}` (table `{e.get('table')}`, column `{e.get('column')}`): filter with "
@@ -153,7 +169,7 @@ def coder_brief(s) -> str:
               "Values to filter by (exact spelling in the data):", *(ents or ["- (none)"])]
     if tabs:
         parts += ["Tables / columns the explainer suggests (a hint; engine functions / `sales_orders` / `item_lines` still come first):", *tabs]
-    if s.rules:
+    if s.rules and rules:
         parts += ["", "# CALCULATION RULES (rulebook / README lines the explainer picked)", *[f"- {r}" for r in s.rules]]
     notes = []
     if not s.answerable:
@@ -174,10 +190,32 @@ def coder_brief(s) -> str:
         out.append(f"- Number of elements: {s.k}.")
     if getattr(s, "unit", None):
         out.append(f"- Unit asked: {s.unit} (convert to it if the data records another unit).")
-    if s.answer_form:
-        out.append(f"- Explainer's description: {s.answer_form}")
+    form = s.answer_form
+    if s.answer_type == "list" and form and PAIR_FORM.search(form):
+        form = ""                      # "each containing the item name and the quantity": contradicts §9 (see LIST_RULE)
+    if form:
+        out.append(f"- Explainer's description: {form}")
+    if s.answer_type == "list":
+        out.append(f"- {LIST_RULE}")
     out.append('- Assign `answer = <expression computed from the data>`; not enough data: `answer = "UNANSWERABLE: <reason>"`.')
     return "\n".join(parts), "\n".join(out)
+
+
+def engine_first(plan: str, ref) -> tuple[str, bool]:
+    """The plan with a first step calling the engine reference, when the plan does not mention that function.
+
+    dev5 biz_104 (top 5): the spec picked `top_items` but its `method` told the Coder to group and join by hand, and the Coder
+    followed the method; b2: 3 of the 9 new abstains ranked customers by hand instead of calling `top_customers`. `ref` is the
+    validated, trusted reference that already ran (engines/reference.py), never the raw `engine_call`."""
+    if ref is None:
+        return plan, False
+    fn = ref.call["function"]
+    if fn in (plan or ""):
+        return plan, False
+    args = ", ".join(f"{k}={v!r}" for k, v in ref.call["args"].items())
+    step = (f"0. FIRST call `{fn}({args})`: the exact engine function for this question (its value is under ENGINE REFERENCE); "
+            "shape its result as OUTPUT requires. The steps below matter only for a condition that function cannot express.")
+    return step + ("\n" + plan if plan else ""), True
 
 
 def build_task(st, rulebook: str, tools: list[str] | None = None) -> str:
@@ -185,9 +223,11 @@ def build_task(st, rulebook: str, tools: list[str] | None = None) -> str:
 
     Stable text first (rulebook, README) so the server's prefix cache serves it across questions of a business; the
     question's own parts follow, and the output contract comes last, closest to where the model starts writing."""
-    body, output = coder_brief(st.brief)
+    guideline = getattr(st, "guideline", None) or []
+    body, output = coder_brief(st.brief, rules=not guideline)
     have = ", ".join(tools) if tools else "(none)"
     ref, hint = getattr(st, "engine_ref", None), getattr(st, "engine_hint", None)
+    plan, _ = engine_first(st.plan, ref)
     context = ("" if getattr(st, "context", None) else       # shared: the rulebook / README / schema open the system prompt
                "# CONTEXT\n"
                f"## RULEBOOK\n{rulebook}\n\n## SHOP README\n{st.ctx.readme[:6000]}\n\n## AVAILABLE FUNCTIONS\n{have}\n\n"
@@ -195,23 +235,31 @@ def build_task(st, rulebook: str, tools: list[str] | None = None) -> str:
     return (context +
             f"## QUESTION\nas_of_date (today) = {st.as_of}\nORIGINAL QUESTION: {st.question}\n\n"
             f"{body}\n\n"
-            + (f"# PLAN (suggested steps)\n{st.plan}\n\n" if st.plan else "")
+            + (f"# PLAN (suggested steps)\n{plan}\n\n" if plan else "")
             + (reference_note(ref) if ref is not None else "")
             + (hint_note(hint) if hint is not None else "")
+            + (getattr(st, "facts", "") or "")                 # VERIFIED FACTS (agents/facts.py)
+            + render_guideline(guideline)                      # the rulebook rows of this question, closest to OUTPUT
             + output)
 
 
 CODE_BLOCK = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
+OPEN_BLOCK = re.compile(r"```(?:python|py)\s*\n(.*)\Z", re.S)
 
 
 def extract_code(text: str) -> str | None:
-    """The last fenced code block of the reply (a model sometimes shows an example first)."""
+    """The last fenced code block of the reply (a model sometimes shows an example first). A reply cut by the output cap
+    has no closing fence: with no closed block, the code after the last ```python fence is used (the sandbox reports a
+    cut-off line as a syntax error) instead of losing the block as "no code"."""
     text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
     blocks = [b.strip() for b in CODE_BLOCK.findall(text) if b.strip()]
     if blocks:
         return blocks[-1]
     m = re.search(r"<code>(.*?)</code>", text, re.S)
-    return m.group(1).strip() if m else None
+    if m:
+        return m.group(1).strip()
+    m = OPEN_BLOCK.search(text)
+    return m.group(1).strip() or None if m else None
 
 
 class Coder:

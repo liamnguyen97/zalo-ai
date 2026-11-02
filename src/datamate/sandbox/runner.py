@@ -13,7 +13,7 @@ from typing import Any
 from smolagents.default_tools import FinalAnswerTool
 from smolagents.local_python_executor import LocalPythonExecutor
 
-from datamate.sandbox.guard import PERIOD_VARS, PROTECTED, GuardedExecutor
+from datamate.sandbox.guard import PERIOD_VARS, PROTECTED, GuardedExecutor, GuardRefusal
 from datamate.sandbox.memory import OOM_HINT, is_oom
 
 AUTHORIZED_IMPORTS = ["pandas", "numpy", "datetime", "re", "math", "unicodedata", "collections", "statistics", "itertools"]
@@ -37,6 +37,7 @@ class RunResult:
     error: str | None = None  # refused by the guard, or raised while running
     answered: bool = False    # the block set `answer` (the turn's value is `value`)
     value: Any = None
+    refused: bool = False     # the guard refused it before it ran (the same block may run when sent again)
 
     def feedback(self) -> str:
         """The text the Coder reads back for this block."""
@@ -47,7 +48,8 @@ class RunResult:
 
     def as_log(self) -> dict:
         return {"code": self.code, "output": self.output[:MAX_OUTPUT], "error": self.error,
-                "answered": self.answered, "value": repr(self.value)[:300] if self.answered else None}
+                "answered": self.answered, "value": repr(self.value)[:300] if self.answered else None,
+                **({"refused": True} if self.refused else {})}
 
 
 class Runner:
@@ -72,6 +74,9 @@ class Runner:
         res = RunResult(code=code)
         try:
             out = self.ex(code)
+        except GuardRefusal as e:   # refused before running: same text as before ("ValueError: ..."), flagged
+            res.error, res.refused = f"ValueError: {e}", True
+            return res
         except Exception as e:  # noqa: BLE001 - refused or failed code is feedback for the Coder, not a crash
             res.error = OOM_HINT if is_oom(e) else f"{type(e).__name__}: {e}"
             return res

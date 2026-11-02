@@ -54,3 +54,11 @@ def test_a_list_returned_as_name_amount_pairs_keeps_the_half_asked_for():
     assert interpret(months, "list", SimpleNamespace(k=None, measure="money", periods=[])).raw == [120, 150]
     unclear = interpret(pairs, "list", SimpleNamespace(k=None, measure="money", periods=[]))
     assert "type" in unclear.issues                                      # names or amounts? the check stays
+
+
+
+def test_money_rounds_half_up_like_the_rulebook():
+    from datamate.answer.formatter import format_answer, round_half_up
+    assert round(2.5) == 2 and round_half_up(2.5) == 3 and round_half_up(12345.4999) == 12345 and round_half_up(-2.5) == -3
+    assert format_answer("number", 175432.5) == {"type": "number", "answer": 175433}
+    assert format_answer("percent", 12.345)["answer"] in (12.34, 12.35)      # percent rounding unchanged (no half rule)

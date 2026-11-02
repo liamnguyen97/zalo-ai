@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from datamate.answer.formatter import round_half_up
 from datamate.data.loader import Business, _base_name, _safe
 from datamate.data.readme import roles_by_section, roles_for_tables
 from datamate.data.status import find_order_col
@@ -55,7 +56,8 @@ class SalesView:
         s = d[m]
         n = int(s["order"].nunique())
         rev = float(s["amount"].sum())
-        return {"revenue": int(round(rev)), "orders": n, "avg_order": int(round(rev / n)) if n else None, "lines": int(len(s))}
+        # §3: the average order value is whole đồng, half a đồng rounded UP (Python's round would round half to even)
+        return {"revenue": int(round(rev)), "orders": n, "avg_order": round_half_up(rev / n) if n else None, "lines": int(len(s))}
 
 
 def _pick_amount(df: pd.DataFrame) -> str | None:

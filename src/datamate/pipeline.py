@@ -44,7 +44,8 @@ class Pipeline:
                            plan_mode=s.plan_mode if s.p2_mode == "fast" else "call", spec_max_tokens=s.spec_max_tokens),
             Coder(self.model), Evaluator(self.model, s.gate), Inputs(split.calendar), split.rulebook,
             s.max_turns, s.coder_steps, s.explainer_reruns,
-            use_selector=s.p2_mode != "fast", decide_after_explainer=s.p2_mode != "fast", shared_prefix=s.shared_prefix)
+            use_selector=s.p2_mode != "fast", decide_after_explainer=s.p2_mode != "fast", shared_prefix=s.shared_prefix,
+            guideline_rows=s.guideline_rows, verified_facts=s.verified_facts)
         self._ctx: dict[str, BusinessContext] = {}
         self._ctx_lock = threading.Lock()
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import date, datetime
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import numpy as np
@@ -22,6 +23,13 @@ def _py(v: Any) -> Any:
     return v
 
 
+def round_half_up(x: float) -> int:
+    """Whole đồng, half a đồng rounded up (rulebook §3 "nửa đồng làm tròn lên"; away from zero for a negative difference).
+    Python's `round` rounds half to EVEN: round(2.5) == 2. No train average-order question hit an exact .5 (0 of 93), so this
+    changes nothing measured; it follows the rule."""
+    return int(Decimal(str(float(x))).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
 def _num(v: Any, *, percent: bool = False) -> int | float:
     v = _py(v)
     if isinstance(v, bool):
@@ -31,7 +39,7 @@ def _num(v: Any, *, percent: bool = False) -> int | float:
     if percent:
         return round(float(v), 2)
     if float(v) == int(float(v)) or abs(float(v)) >= 1e3:  # money (incl. averages of money) is whole đồng
-        return int(round(float(v)))  # VND amounts / counts are integers
+        return round_half_up(float(v))  # VND amounts / counts are integers
     return round(float(v), 2)
 
 

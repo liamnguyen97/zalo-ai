@@ -96,6 +96,9 @@ def test_extract_code_takes_the_last_block():
     assert extract_code("ví dụ:\n```python\nx = 1\n```\nthật:\n```python\nanswer = 2\n```") == "answer = 2"
     assert extract_code("<think>...</think>```py\nprint(1)\n```") == "print(1)"
     assert extract_code("không có code") is None
+    assert extract_code("```python\nd = tables['don']\nanswer = len(d)") == "d = tables['don']\nanswer = len(d)"   # cut by the cap
+    assert extract_code("```python\nx = 1\n```\nrồi:\n```python\nanswer = x +") == "x = 1"      # a closed block still wins
+    assert extract_code("```python\n") is None
 
 
 # ------------------------------------------------------------------ Evaluator
@@ -249,6 +252,8 @@ def test_a_coder_that_disagrees_with_the_engine_reference_is_sent_back_once():
     o.inputs = _Tools()
     assert o.run(st) == {"type": "number", "answer": 7}
     assert "ENGINE REFERENCE" in m.prompts("code")[0] and "debt_repaid(" in m.prompts("code")[0]
+    assert "0. FIRST call `debt_repaid(start='2026-05-01', end='2026-05-31')`" in m.prompts("code")[0]   # the plan did not name it
+    assert any(e.get("plan_engine_step") for e in st.log["orchestrator"])
     assert st.log["turns"][0]["issues"] == ["engine_mismatch"] and st.log["turns"][0]["verdict"]["source"] == "checks"
     # a Coder that keeps its own value on the second turn is trusted
     m2 = Scripted(code=[wrong], explain=[{"spec": {**SPEC, "engine_call": call}}], orch=[{"action": "coder"}])
@@ -447,3 +452,105 @@ def test_the_hint_reaches_the_task_and_is_logged_without_deciding_the_verdict():
     assert o.run(st) == {"type": "number", "answer": 2}
     assert "ENGINE HINT" in m.prompts("code")[0] and "item_qty" in m.prompts("code")[0]
     assert st.log["routing"][0]["agrees"] is True and len(st.log["turns"]) == 1
+
+
+# ------------------------------------------------------------------ stuck Coder: guard resubmission, same error twice
+class _OrdersInputs:
+    """Inputs stub: the real sandbox variables plus `sales_orders` (so the `~valid` guard can fire)."""
+    def variables(self, st):
+        so = pd.DataFrame({"order": ["O1", "O2", "O3"], "date": pd.to_datetime(["2026-05-01", "2026-05-02", "2026-05-03"]),
+                           "valid": [True, False, True], "status_std": ["completed", "cancelled", "completed"]})
+        return {"tables": {k: v.copy() for k, v in TABLES.items()}, "sales_orders": so,
+                "period_start": pd.Timestamp("2026-05-01"), "period_end": pd.Timestamp("2026-05-31")}
+
+
+def test_a_block_the_guard_refused_once_runs_when_sent_again():
+    # the guard says "send the same block again"; before, the repeat check refused the resubmission as IDENTICAL
+    block = "```python\nso = sales_orders\nanswer = int((~so['valid']).sum())\n```"
+    m = Scripted(code=[block])
+    st = _st()
+    o = _orch(m)
+    o.inputs = _OrdersInputs()
+    assert o.run(st) == {"type": "number", "answer": 1}
+    steps = st.log["turns"][0]["steps"]
+    assert len(steps) == 2 and steps[0].get("refused") and "send the same block again" in steps[0]["error"]
+    assert steps[1]["answered"] and "IDENTICAL" not in (steps[1]["error"] or "")
+
+
+def test_the_same_error_twice_ends_the_turn_early_and_says_why():
+    bad = ["```python\nprint(tables['nope'])\n```", "```python\nx = 1\nprint(tables['nope'])\n```",
+           "```python\ny = 2\nprint(tables['nope'])\n```", LOOK]
+    m = Scripted(code=bad)
+    st = _st()
+    assert _orch(m, max_turns=1, coder_steps=6).run(st) == {"type": "abstain"}
+    turn = st.log["turns"][0]
+    assert len(turn["steps"]) == 3                                      # not 6: two repeats of the same error end the turn
+    assert any(e.get("stuck") == 2 for e in st.log["orchestrator"])
+    assert turn["verdict"]["source"] == "no_answer" and "ended after 3 blocks" in turn["verdict"]["feedback"]
+    assert sum(1 for k in m.kwargs if k.get("temperature")) >= 1       # the call after a repeated error is sampled
+
+
+def test_the_plan_starts_with_the_engine_call_only_when_it_does_not_name_it():
+    from datamate.agents.coder import engine_first
+    from datamate.engines.reference import Reference
+    ref = Reference({"function": "top_items", "args": {"k": 5, "start": "2026-06-01", "end": "2026-06-30"}}, [("A", 9)])
+    plan, added = engine_first("1. group item_lines by item\n2. sum qty_base", ref)
+    assert added and plan.startswith("0. FIRST call `top_items(k=5,") and plan.endswith("2. sum qty_base")
+    assert engine_first("1. call top_items(5, ...) and keep the names", ref) == ("1. call top_items(5, ...) and keep the names", False)
+    assert engine_first("", ref)[0].startswith("0. FIRST call") and engine_first("1. x", None) == ("1. x", False)
+
+
+def test_unambiguous_shapes_are_fixed_and_the_rest_get_a_concrete_reshape_hint():
+    from datamate.answer.evaluator import reshape_hint
+    from datamate.answer.interpreter import interpret
+    top = SimpleNamespace(k=2, periods=[], measure="quantity")
+    plain = SimpleNamespace(k=None, periods=[], measure="money")
+    # one (name, number) pair for a one-value question: the half it asks for
+    assert interpret([("Chị Lan", 3200000)], "string", plain).raw == "Chị Lan"
+    assert interpret(("Chị Lan", 3200000), "number", plain).raw == 3200000
+    # a ranking kept as a Series formatted as its amounts before; names for a top-k, amounts for period labels
+    it = interpret(pd.Series([9, 7], index=["Bánh A", "Bánh B"]), "list", top)
+    assert (it.kind, it.raw, it.issues) == ("list", ["Bánh A", "Bánh B"], [])
+    assert interpret(pd.Series([5, 6], index=["2025-04", "2025-05"]), "list", plain).raw == [5, 6]
+    assert list(interpret(pd.Series([5, 6], index=["Tiền mặt", "Chuyển khoản"]), "list", plain).raw) == [5, 6]  # unchanged
+    # a DataFrame for a list question is judged as its rows
+    df = pd.DataFrame({"item": ["Bánh A", "Bánh B"], "qty": [9, 7]})
+    assert interpret(df, "list", top).raw == ["Bánh A", "Bánh B"]
+    assert interpret(df, "list", plain).issues == ["type"]                 # names or amounts? not clear: still refused
+    # the refusal says how to reshape instead of only "re-read the question"
+    st, steps = _st(), [RunResult(code="answer = df", answered=True, value=None)]
+    st.answer_type = "list"
+    st.brief = SimpleNamespace(k=None)
+    v = _ev({"verdict": "accept"}).evaluate(st, "C", steps, True, None, Interpretation("table", None, ["type"]), None)
+    assert "only change the form" in v.feedback and "[r[0] for r in rows]" in v.feedback
+    assert "ONE name" in reshape_hint("string", "list") and "len(...)" in reshape_hint("number", "list")
+
+
+
+def test_records_and_rows_of_dicts_do_not_crash_the_interpreter():
+    # dev5-coderphase q_33e8f7506387: a KeyError: 0 here abstained the whole question (pipeline catch-all), not the turn
+    from datamate.answer.interpreter import interpret
+    top = SimpleNamespace(k=2, periods=[], measure="quantity")
+    recs = [{"item": "Bánh A", "q": 9}, {"item": "Bánh B", "q": 7}]
+    assert interpret(recs, "list", top).raw == ["Bánh A", "Bánh B"]
+    assert interpret([{"item": "Bánh A"}, {"item": "Bánh B"}], "list", top).raw == ["Bánh A", "Bánh B"]
+    it = interpret({"columns": ["item", "q"], "rows": recs}, "table", top)
+    assert it.kind == "table" and "risky_type" in it.issues                  # judged, not crashed
+    assert interpret([{"item": "khách lẻ", "q": 9}], "list", SimpleNamespace(k=None, periods=[], measure="money")).issues
+
+
+def test_an_interpreter_error_rejects_the_turn_not_the_question(monkeypatch):
+    import datamate.agents.orchestrator as orch
+    calls = {"n": 0}
+
+    def flaky(raw, expected, spec):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyError(0)
+        from datamate.answer.interpreter import interpret
+        return interpret(raw, expected, spec)
+    monkeypatch.setattr(orch, "interpret", flaky)
+    m = Scripted(code=[RIGHT])
+    st = _st()
+    assert _orch(m).run(st) == {"type": "number", "answer": 2}
+    assert any("interpreter_error" in e for e in st.log["orchestrator"]) and len(st.log["turns"]) == 2

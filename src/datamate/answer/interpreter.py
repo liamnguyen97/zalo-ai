@@ -98,9 +98,12 @@ def _names(raw: Any) -> list[str]:
     if isinstance(raw, str):
         return [raw]
     if isinstance(raw, (list, tuple)):
-        return [x for x in raw if isinstance(x, str)] + [r[0] for r in raw if isinstance(r, (list, tuple)) and r and isinstance(r[0], str)]
-    if isinstance(raw, dict) and "rows" in raw:
-        return [r[0] for r in raw["rows"] if r and isinstance(r[0], str)]
+        return ([x for x in raw if isinstance(x, str)] + [r[0] for r in raw if isinstance(r, (list, tuple)) and r and isinstance(r[0], str)]
+                + [v for r in raw if isinstance(r, dict) and r for v in [next(iter(r.values()))] if isinstance(v, str)])
+    if isinstance(raw, dict) and isinstance(raw.get("rows"), (list, tuple)):
+        # rows may be dicts ({"columns": [...], "rows": [{"item": ...}]}): `r[0]` was a KeyError that abstained the question
+        return [c for r in raw["rows"] if r for c in [r[0] if isinstance(r, (list, tuple)) else next(iter(r.values())) if isinstance(r, dict) else None]
+                if isinstance(c, str)]
     if isinstance(raw, pd.DataFrame) and len(raw.columns):
         return [x for x in raw.iloc[:, 0].tolist() if isinstance(x, str)]
     return []
@@ -197,9 +200,23 @@ def _list_from_pairs(raw: Any, spec) -> list | None:
         return None
     if all(PERIOD_LABEL.match(r[0]) for r in rows):
         return [r[1] for r in rows]
-    if getattr(spec, "k", None) or getattr(spec, "measure", None) == "name":
+    if _names_wanted(spec):
         return [r[0] for r in rows]
     return None
+
+
+def _one_pair(raw: Any) -> tuple | None:
+    """(name, number) when the value is ONE such pair, alone or as the only row: `top_customers(1, ...)` returns
+    [('Chị Lan', 3200000)] for "khách nào mua nhiều nhất" / "khách mua nhiều nhất mua bao nhiêu tiền"."""
+    if isinstance(raw, (list, tuple)) and len(raw) == 1 and isinstance(raw[0], (list, tuple)):
+        raw = raw[0]
+    if isinstance(raw, (list, tuple)) and len(raw) == 2 and isinstance(raw[0], str) and _is_num(raw[1]):
+        return tuple(raw)
+    return None
+
+
+def _names_wanted(spec) -> bool:
+    return bool(getattr(spec, "k", None)) or getattr(spec, "measure", None) == "name"
 
 
 def interpret(raw: Any, expected: str | None = None, spec=None) -> Interpretation:
@@ -217,6 +234,28 @@ def interpret(raw: Any, expected: str | None = None, spec=None) -> Interpretatio
         raw = raw[0]
     if isinstance(raw, np.generic):
         raw = raw.item()
+    # one (name, number) pair for a one-value question: the half it asks for (a revise turn costs a Coder + a judge call)
+    if expected in ("string", "date", "number", "percent") and (pair := _one_pair(raw)) is not None:
+        raw = pair[1] if expected in ("number", "percent") else pair[0]
+    # a ranking kept as a Series (`...sum().nlargest(5)`: names in the index, amounts in the values) formats as its VALUES:
+    # for a top-k / names question the names are the answer; period labels in the index mean the amounts are
+    if (expected == "list" and isinstance(raw, pd.Series) and len(raw) and all(isinstance(i, str) for i in raw.index)
+            and all(_is_num(v) for v in raw.tolist())):
+        if all(PERIOD_LABEL.match(i) for i in raw.index):
+            raw = raw.tolist()
+        elif _names_wanted(spec):
+            raw = list(raw.index)
+    # records (`df.to_dict('records')`) for a list question: their values as rows, judged like a list of rows below
+    if (expected == "list" and isinstance(raw, (list, tuple)) and raw and all(isinstance(r, dict) and r for r in raw)
+            and len({tuple(r) for r in raw}) == 1):
+        rows = [list(r.values()) for r in raw]
+        raw = [r[0] for r in rows] if len(rows[0]) == 1 else rows
+    # a DataFrame for a list question: one column is the list; two columns resolve like [name, amount] rows, else unchanged
+    if expected == "list" and isinstance(raw, pd.DataFrame) and len(raw):
+        if len(raw.columns) == 1:
+            raw = raw.iloc[:, 0].tolist()
+        elif len(raw.columns) == 2 and (half := _list_from_pairs(raw.values.tolist(), spec)) is not None:
+            raw = half
 
     if _empty(raw):
         return Interpretation(expected or "string", raw, ["empty"])
@@ -244,7 +283,7 @@ def interpret(raw: Any, expected: str | None = None, spec=None) -> Interpretatio
         except (ValueError, TypeError):
             kind = shape
             issues.append("type")
-    elif expected == "list" and shape == "table" and _is_rows(raw) and all(len(r) == 1 for r in raw if isinstance(r, (list, tuple))):
+    elif expected == "list" and shape == "table" and _is_rows(raw) and all(isinstance(r, (list, tuple)) and len(r) == 1 for r in raw):
         raw, kind = [r[0] for r in raw], "list"
     elif expected == "list" and shape == "table" and (half := _list_from_pairs(raw, spec)) is not None:
         raw, kind = half, "list"

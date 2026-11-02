@@ -89,6 +89,12 @@ class Settings:
     # against 1 and 2 without (ledger #9); to be retried with the Coder's key instructions repeated after the question.
     shared_prefix: bool = field(default_factory=lambda: _flag("DATAMATE_SHARED_PREFIX", False))
 
+    # Coder phase (agents/guideline.py, agents/facts.py): the rulebook rows that decide the question, repeated right before the
+    # Coder's OUTPUT with the column / function that applies them (0 = off: the spec's rows stay in CALCULATION RULES), and the
+    # counts computed from the data for the question's periods (VERIFIED FACTS).
+    guideline_rows: int = field(default_factory=lambda: int(os.getenv("DATAMATE_GUIDELINE_ROWS", "4")))
+    verified_facts: bool = field(default_factory=lambda: _flag("DATAMATE_VERIFIED_FACTS", True))
+
     workers: int = field(default_factory=lambda: int(os.getenv("DATAMATE_WORKERS", "4")))
 
     @property

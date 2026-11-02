@@ -18,7 +18,7 @@ from datamate.text import fold
 
 CALLS = ("sales_metrics", "item_qty", "item_revenue", "top_items", "item_price_on", "item_qty_change", "size_qty",
          "debt_total", "debt_by_customer", "debt_customers", "debt_aging", "debt_repaid", "debt_new", "top_customers",
-         "purchase_total", "purchase_avg_price", "top_supplier")
+         "purchase_total", "purchase_avg_price", "top_supplier", "cancel_rate")
 DATE_ARGS = ("start", "end", "day")
 
 

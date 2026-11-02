@@ -21,7 +21,8 @@ from datamate.llm import chat
 from datamate.text import fold_text
 
 ISSUE_TEXT = {
-    "type": "answer type mismatch: the question needs `{expected}`, the code returned `{kind}`. Re-read the question: what value does it ask for?",
+    "type": "answer type mismatch: the question needs `{expected}`, the code returned `{kind}`. If the computed values are right, "
+            "keep the calculation and only change the form: {reshape}. Otherwise re-read the question: what value does it ask for?",
     "zero": "the result is 0. Usually a wrong filter (name spelled differently, status, date range, data type). Print the row "
             "count after EACH filter to find the step that loses the data; answer 0 only if the data really gives 0.",
     "sentinel": "the result is a placeholder value (999...9) in the data, not a real measurement. If the data only has the "
@@ -42,6 +43,28 @@ ISSUE_TEXT = {
     "format": "the value cannot be put in the required answer form ({kind}). Return exactly the form in the OUTPUT section.",
 }
 
+def reshape_hint(expected: str | None, kind: str | None) -> str:
+    """How to turn the form the code returned into the one the question needs. dev5 biz_104: the top 5 came back with their
+    quantities, the feedback only said "re-read the question", and the Coder rebuilt the ranking by hand and got it wrong."""
+    one = {"number": "ONE number, no name and no unit", "percent": "ONE percent number (12.4 means 12.4%), no name"}
+    if expected == "list" and kind == "table":
+        return ("a flat Python list of ONLY the elements asked for: the names `[r[0] for r in rows]` (or `df.iloc[:, 0].tolist()`), "
+                "or the numbers when the question asks for numbers")
+    if expected in one and kind in ("list", "table"):
+        return one[expected] + ": if you listed the objects to count them, `len(...)` of the distinct ones; if one value is asked, that value alone"
+    if expected in one:
+        return one[expected]
+    if expected == "string":
+        return "ONE name copied from the data, e.g. the first of a ranking `ranking[0][0]`, without its amount"
+    if expected == "table":
+        return '{"columns": [...], "rows": [[...], ...]} with exactly the columns the question asks for'
+    if expected == "date":
+        return "a string 'YYYY-MM-DD' (a month: 'YYYY-MM')"
+    if expected == "boolean":
+        return "True or False"
+    return "the form in the OUTPUT section"
+
+
 JUDGE_SYSTEM = """\
 You are the ANSWER JUDGE of a question-answering system over a shop's data. Read the ORIGINAL QUESTION (Vietnamese), the SPEC
 (English rewrite), the OUTPUT REQUIREMENT, the CODE that computed the value and what the code PRINTED, and decide whether the
@@ -50,6 +73,8 @@ Check: (1) the code computes EXACTLY the quantity asked (amount of goods vs mone
 (2) the right period, item / customer / group, no condition added or dropped relative to the ORIGINAL question (the original
 wins over the spec); (3) order status filtered per the rulebook; (4) the answer form is the required one; (5) the value matches
 what the code printed.
+A `list` answer holds ONLY names or ONLY numbers (rulebook §9): a list of names without their amounts is the required form, even
+if a description mentions amounts; never ask to add amounts, pairs or dicts to a list.
 The code ran to completion; if the middle part is elided that is only how it is displayed, NOT an error: do not criticise the
 code as "cut off" or "incomplete". Criticise only errors visible in the logic.
 - accept: the answer fits the question.
@@ -107,9 +132,12 @@ class Evaluator:
         Formatter's line (None when the value could not be formatted)."""
         if not answered:
             errs = sorted({(r.error or "")[:200] for r in steps if r.error})
+            stop = getattr(st, "stop_reason", "")
             return Verdict("revise", "no_answer", feedback=(
                 f"The previous turn did not assign `answer` after {len(steps)} blocks (" + "; ".join(errs or ["no error, only exploration"])
-                + "). Write fewer blocks: compute directly, print intermediate results, then assign `answer = <expression>`.\n"
+                + ")." + (f" {stop[:1].upper() + stop[1:]}: do NOT send that code again, take a different route (an engine "
+                          "function, `sales_orders` / `item_lines`, or print the row count after each filter)." if stop else "")
+                + " Write fewer blocks: compute directly, print intermediate results, then assign `answer = <expression>`.\n"
                 + _last_code(steps)))
         if interp.kind == "unanswerable":
             return self._judge(st, contract, steps, raw, interp, unanswerable=True)
@@ -117,7 +145,8 @@ class Evaluator:
         if issues and self.gate:
             lines = [f"The previous turn returned {raw!r:.200} but a check rejected it:"]
             lines += ["- " + ISSUE_TEXT.get(i, i).format(expected=st.answer_type or "?", kind=interp.kind, k=getattr(st.brief, "k", None),
-                                                  ref=getattr(getattr(st, "engine_ref", None), "text", ""))
+                                                  ref=getattr(getattr(st, "engine_ref", None), "text", ""),
+                                                  reshape=reshape_hint(st.answer_type, interp.kind))
                       for i in issues]
             return Verdict("revise", "checks", feedback="\n".join(lines) + "\n" + _last_code(steps))
         return self._judge(st, contract, steps, raw, interp)

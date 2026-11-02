@@ -24,6 +24,12 @@ PERIOD_VARS = ("period_start", "period_end", "compare_start", "compare_end")  # 
 CONST_FUNCS = {"round", "int", "float", "abs", "str"}  # wrappers that keep an expression constant
 
 
+class GuardRefusal(ValueError):
+    """A block the guard refused BEFORE it ran. Unlike a runtime error, the same block sent again may run: several checks
+    refuse only once ("If you really need this merge, send it again"), so the orchestrator must not treat the resubmission
+    as a repeat of a block that already ran."""
+
+
 def _is_unanswerable_const(n: ast.AST) -> bool:
     if isinstance(n, ast.Constant):
         return isinstance(n.value, str) and n.value.upper().startswith("UNANSWERABLE")
@@ -82,9 +88,36 @@ class GuardedExecutor:
 
     def __call__(self, code_action: str):
         try:
+            code_action = self._screen(code_action)
+        except GuardRefusal:
+            raise
+        except ValueError as e:      # every refusal of the checks: the block did not run
+            raise GuardRefusal(str(e)) from None
+        try:
+            res = self._inner(code_action)
+            self._seen_text += f"\n{getattr(res, 'logs', '')}\n{getattr(res, 'output', '')}"
+            return res
+        except SystemExit as e:
+            # `raise SystemExit` escapes the sandbox and, through the thread pool, silently ended whole runs (exit 0,
+            # no summary: dev300b A at 222/300, B' at 248, target R1 at 46, R3 at 69). Turn it into a step error.
+            raise ValueError(f"Do not stop the program (SystemExit {e.code!r}): assign `answer = <value>`, or "
+                             "`answer = \"UNANSWERABLE: <reason>\"` when the data is insufficient.") from None
+        except Exception as e:  # noqa: BLE001 - re-raised with a more useful message for the feedback loop
+            better = self.explain_error(str(e), code_action)
+            if better == str(e):
+                raise
+            try:
+                err = type(e)(better)
+            except Exception:  # noqa: BLE001 - exception type with an unusual constructor
+                raise e from None
+            raise err from None
+
+    def _screen(self, code_action: str) -> str:
+        """The code to run after the silent rewrites; raises ValueError when a check refuses the block."""
+        try:
             tree = ast.parse(code_action)
         except SyntaxError:
-            return self._inner(code_action)  # let the sandbox report the syntax error as usual
+            return code_action  # let the sandbox report the syntax error as usual
         tree, rewritten = self._rewrite_dtype_helpers(tree)
         tree, dropped = self._drop_period_redefinitions(tree)
         tree, dropped_lit = self._drop_literal_after_computed_answer(tree)
@@ -132,24 +165,7 @@ class GuardedExecutor:
         if sets_answer and not has_final:
             code_action = code_action.rstrip() + "\nfinal_answer(answer)\n"
         self._consts = consts
-        try:
-            res = self._inner(code_action)
-            self._seen_text += f"\n{getattr(res, 'logs', '')}\n{getattr(res, 'output', '')}"
-            return res
-        except SystemExit as e:
-            # `raise SystemExit` escapes the sandbox and, through the thread pool, silently ended whole runs (exit 0,
-            # no summary: dev300b A at 222/300, B' at 248, target R1 at 46, R3 at 69). Turn it into a step error.
-            raise ValueError(f"Do not stop the program (SystemExit {e.code!r}): assign `answer = <value>`, or "
-                             "`answer = \"UNANSWERABLE: <reason>\"` when the data is insufficient.") from None
-        except Exception as e:  # noqa: BLE001 - re-raised with a more useful message for the feedback loop
-            better = self.explain_error(str(e), code_action)
-            if better == str(e):
-                raise
-            try:
-                err = type(e)(better)
-            except Exception:  # noqa: BLE001 - exception type with an unusual constructor
-                raise e from None
-            raise err from None
+        return code_action
 
     @staticmethod
     def _rewrite_dtype_helpers(tree: ast.Module) -> tuple[ast.Module, int]:

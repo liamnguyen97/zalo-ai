@@ -18,11 +18,14 @@ import re
 import time
 from dataclasses import dataclass
 
-from datamate.agents.coder import Coder, build_task, coder_brief
+from datamate.agents.coder import Coder, build_task, coder_brief, engine_first
+from datamate.agents.facts import verified_facts
+from datamate.agents.guideline import parse_rows
+from datamate.agents.guideline import select as select_rules
 from datamate.answer.evaluator import Evaluator
 from datamate.answer.formatter import format_answer
-from datamate.answer.interpreter import as_count, interpret
-from datamate.engines.functions import TOOL_NAMES
+from datamate.answer.interpreter import Interpretation, as_count, interpret
+from datamate.engines.functions import TOOL_NAMES, rule_gated
 from datamate.data.onboarding import summary
 from datamate.agents.coverage import no_identified_customers, period_outside_data
 from datamate.agents.shared import shared_context
@@ -32,6 +35,12 @@ from datamate.llm import chat
 from datamate.sandbox.runner import Runner, RunResult
 
 REPEAT_TEMPERATURE = 0.5     # Coder temperature after it resubmitted a block it had already run (otherwise 0: reproducible)
+STUCK_LIMIT = 2              # blocks that repeat a block or the previous error before the turn ends early
+
+
+def _same_error(a: str, b: str) -> bool:
+    """Two block errors that say the same thing (whitespace aside)."""
+    return re.sub(r"\s+", " ", a or "").strip()[:400] == re.sub(r"\s+", " ", b or "").strip()[:400]
 
 SYSTEM = """\
 You are the ORCHESTRATOR (main agent) of a question-answering system over a shop's data. You see the question (Vietnamese),
@@ -81,7 +90,8 @@ def spec_summary(s) -> str:
 class Orchestrator:
     def __init__(self, model, col_selector, explainer, coder: Coder, evaluator: Evaluator, inputs, rulebook: str,
                  max_turns: int = 3, coder_steps: int = 6, explainer_reruns: int = 1,
-                 use_selector: bool = True, decide_after_explainer: bool = True, shared_prefix: bool = False):
+                 use_selector: bool = True, decide_after_explainer: bool = True, shared_prefix: bool = False,
+                 guideline_rows: int = 4, verified_facts: bool = True):
         self.model, self.col_selector, self.explainer, self.coder, self.evaluator = model, col_selector, explainer, coder, evaluator
         self.inputs, self.rulebook = inputs, rulebook
         self.max_turns, self.coder_steps, self.explainer_reruns = max_turns, coder_steps, explainer_reruns
@@ -90,6 +100,10 @@ class Orchestrator:
         # "August 2025 is in the future" of 2026-05-25 and turned a right engine value into a wrong "unanswerable")
         self.use_selector, self.decide_after_explainer = use_selector, decide_after_explainer
         self.shared_prefix = shared_prefix          # agents/shared.py: the shop's context opens every call
+        self.gated = rule_gated(rulebook)           # engines whose rulebook row is not in this split's rulebook: off
+        # Coder phase: the rulebook rows of the question before OUTPUT (agents/guideline.py), counts from the data (agents/facts.py)
+        self.guideline_rows, self.verified_facts = guideline_rows, verified_facts
+        self.rule_rows = parse_rows(rulebook) if guideline_rows else []
 
     # ------------------------------------------------------------------ bookkeeping
     def _call(self, st, agent: str, fn, **info):
@@ -128,7 +142,8 @@ class Orchestrator:
         else:
             st.tables, st.selection, st.schema = st.ctx.tables, {}, st.ctx.schema
         try:   # the functions this shop has, named in the spec prompt (fast mode)
-            st.functions = sorted(k for k, v in self.inputs.tools(st.ctx).items() if callable(v) and k in TOOL_NAMES)
+            st.functions = sorted(k for k, v in self.inputs.tools(st.ctx).items()
+                                  if callable(v) and k in TOOL_NAMES and k not in self.gated)
         except Exception:  # noqa: BLE001
             st.functions = []
         st.context = (shared_context(self.rulebook, st.ctx.readme, st.schema, st.functions) if self.shared_prefix else None)
@@ -150,6 +165,8 @@ class Orchestrator:
 
         for turn in range(1, self.max_turns + 1):
             variables = self.inputs.variables(st)
+            for name in self.gated:
+                variables.pop(name, None)
             have = sorted(k for k, v in variables.items() if callable(v) and k in TOOL_NAMES)
             ob = getattr(st.ctx, "onboarding", None)
             if ob is not None:
@@ -163,10 +180,20 @@ class Orchestrator:
             if st.engine_hint is not None:
                 st.log["orchestrator"].append({"engine_hint": st.engine_hint.text, "turn": turn})
             if st.engine_ref is not None:
-                st.log["orchestrator"].append({"engine_reference": st.engine_ref.text, "turn": turn})
+                st.log["orchestrator"].append({"engine_reference": st.engine_ref.text, "turn": turn,
+                                               "plan_engine_step": engine_first(st.plan, st.engine_ref)[1]})
             if gone := period_outside_data(st.brief, variables):                  # §7: no data is not 0
                 st.log["orchestrator"].append({"coverage": gone, "turn": turn})
                 return format_answer("unanswerable", "UNANSWERABLE: " + gone)
+            cols = {str(c) for k in ("sales_orders", "item_lines") if variables.get(k) is not None for c in variables[k].columns}
+            st.guideline = (select_rules(st.question, st.as_of, self.rule_rows, getattr(st.brief, "rules", None), have,
+                                         variables.get("sales_orders"), getattr(st.brief, "measure", None), self.guideline_rows,
+                                         columns=cols)
+                            if self.guideline_rows else [])
+            st.facts = verified_facts(st.question, st.brief, variables) if self.verified_facts else ""
+            st.log.setdefault("coder_inputs", []).append({
+                "turn": turn, "guideline": [f"{e.source}: {e.label or e.text[:60]}" for e in st.guideline],
+                "facts": len(st.facts.splitlines()) - 1 if st.facts else 0})
             task = build_task(st, self.rulebook, have)
             _, contract = coder_brief(st.brief)
             steps = self._code_and_run(st, turn, task, variables, feedback)
@@ -176,7 +203,11 @@ class Orchestrator:
             if answered:                                                       # INTERPRETER
                 if getattr(st.brief, "measure", None) == "count" and st.answer_type == "number":
                     raw = as_count(raw)
-                interp = self._call(st, "interpreter", lambda: interpret(raw, st.answer_type, st.brief), turn=turn)
+                try:
+                    interp = self._call(st, "interpreter", lambda: interpret(raw, st.answer_type, st.brief), turn=turn)
+                except Exception as e:  # noqa: BLE001 - an odd value rejects the turn (the Coder retries), never the question
+                    st.log["orchestrator"].append({"interpreter_error": f"{type(e).__name__}: {e}"[:200], "turn": turn})
+                    interp = Interpretation(st.answer_type or "string", raw, ["type"])
                 if interp.issues == ["zero"] and any(t.get("issues") == ["zero"] for t in turns):
                     interp.issues = []     # a 0 sent back once and returned again after re-checking the filters is the data's
                 if st.engine_hint is not None and interp.kind != "unanswerable":       # measured, not enforced
@@ -218,26 +249,44 @@ class Orchestrator:
         return {"type": "abstain"}
 
     def _code_and_run(self, st, turn: int, task: str, variables: dict, feedback: str) -> list[RunResult]:
-        """CODER <-> RUNNER until a block sets `answer` or the step budget is used."""
-        runner, steps, seen, repeats = Runner(variables, getattr(st.brief, "answerable", False) is True), [], {}, 0
+        """CODER <-> RUNNER until a block sets `answer`, the step budget is used, or the Coder is stuck.
+
+        Stuck = a block IDENTICAL to one that already ran, or a block that fails with the same error as the block before it
+        (dev300 q_b445c50f6b5e: near-identical blocks kept failing the same way, 12 Coder calls, abstain; b2: 4 of the 9 new
+        abstains came after a repeated block). After STUCK_LIMIT such blocks the turn ends early: the Evaluator's feedback
+        starts the next turn instead of burning the rest of the budget."""
+        runner, steps, seen, repeats, stuck = Runner(variables, getattr(st.brief, "answerable", False) is True), [], {}, 0, 0
+        st.stop_reason = ""
         for _ in range(self.coder_steps):
             # a block that repeats an earlier one at temperature 0 can only fail the same way: the next call is sampled
             temp = REPEAT_TEMPERATURE if repeats else None
             code = self._call(st, "coder", lambda: self.coder.write(task, steps, feedback, temperature=temp, context=getattr(st, "context", None)), turn=turn,
                               **({"temperature": temp} if temp else {}))
             if not code:
-                steps.append(RunResult(code="", error="No code block found: reply with exactly one ```python ... ``` block"))
-                continue
-            key = re.sub(r"\s+", " ", code).strip()
-            if key in seen:
-                repeats += 1
-                steps.append(RunResult(code=code, error=(
-                    f"This block is IDENTICAL to block {seen[key]} and was not run again. Change the approach: print the "
-                    "intermediate values, check the table and column names, or use `sales_orders` / `item_lines` / an engine function.")))
-                continue
-            seen[key] = len(steps) + 1
-            res = self._call(st, "runner", lambda: runner.run(code), turn=turn)
+                res = RunResult(code="", error="No code block found: reply with exactly one ```python ... ``` block")
+            else:
+                key = re.sub(r"\s+", " ", code).strip()
+                if key in seen:
+                    repeats, stuck = repeats + 1, stuck + 1
+                    steps.append(RunResult(code=code, error=(
+                        f"This block is IDENTICAL to block {seen[key]} and was not run again. Change the approach: print the "
+                        "intermediate values, check the table and column names, or use `sales_orders` / `item_lines` / an engine function.")))
+                    if stuck >= STUCK_LIMIT:
+                        break
+                    continue
+                res = self._call(st, "runner", lambda: runner.run(code), turn=turn)
+                if not res.refused:      # a refused block did not run: sent again, it may run (once-only guard checks)
+                    seen[key] = len(steps) + 1
+            prev = steps[-1] if steps else None
             steps.append(res)
             if res.answered:
                 break
+            if res.error and prev is not None and prev.error and _same_error(prev.error, res.error):
+                repeats, stuck = repeats + 1, stuck + 1
+                if stuck >= STUCK_LIMIT:
+                    break
+        if stuck >= STUCK_LIMIT and not (steps and steps[-1].answered):
+            st.stop_reason = (f"the turn was ended after {len(steps)} blocks because the code kept failing the same way "
+                              "(an identical block or the same error twice)")
+            st.log["orchestrator"].append({"stuck": stuck, "blocks": len(steps), "turn": turn})
         return steps

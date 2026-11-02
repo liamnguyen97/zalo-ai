@@ -133,6 +133,9 @@ class QAState:
     plan: str = ""
     engine_ref: Any = None          # engines/reference.Reference: the Explainer's engine call and its value (or None)
     engine_hint: Any = None         # engines/routing.Hint: advisory engine call derived from the spec (or None)
+    stop_reason: str = ""           # why the Coder <-> Runner loop of the current turn ended early (stuck), else ""
+    guideline: list = field(default_factory=list)   # agents/guideline.Entry: rulebook rows for this question, before OUTPUT
+    facts: str = ""                 # VERIFIED FACTS: counts computed from the data for this question's periods / values
 
     @property
     def question(self) -> str:

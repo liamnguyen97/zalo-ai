@@ -172,7 +172,8 @@ ENGINE FUNCTIONS available to the programmer (exact by the rulebook): sales_metr
 whole shop; item_qty / item_revenue(item, start, end); top_items(k, start, end, by='qty'|'amount'); item_price_on(item, day);
 item_qty_change(item, day, n) -> % change of quantity over n days from day vs the n days before; size_qty(size, start, end);
 debt_total(day, older_than_days=None); debt_by_customer(day, k); debt_customers(day); debt_aging(day, edges=(7, 15));
-debt_repaid(start, end, customer=None); debt_new(start, end, customer=None); top_customers(k, start, end) (walk-in customers removed).
+debt_repaid(start, end, customer=None); debt_new(start, end, customer=None); top_customers(k, start, end) (walk-in customers removed);
+cancel_rate(start, end) = % of the orders placed in the period that were cancelled (denominator: every order, every status).
 PURCHASES (when the shop has them): purchase_total(start, end) = money of the purchase slips dated in the period, cancelled slips left
 out; purchase_avg_price(item, start, end, unit) = average import price of an item per `unit` ("một thùng" -> 'thùng'), weighted by the
 quantity bought; top_supplier(start, end, k) -> [(supplier, money)]. A purchase slip's total column covers EVERY item on the slip.

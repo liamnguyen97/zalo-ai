@@ -151,6 +151,18 @@ def build_tools(sales: SalesView | None, items: ItemView | None, debt: DebtView 
                 return [(n, int(round(v))) for n, v in purchases.top_suppliers(_ts(start), _ts(end), int(k))]
             tools["top_supplier"] = top_supplier
 
+    if orders is not None and {"date", "status_std"} <= set(orders.columns):   # rulebook §1 "Tỉ lệ đơn huỷ trong kỳ"
+        def cancel_rate(start, end):
+            """% of the orders PLACED in [start, end] that are cancelled, 2 decimals. The denominator is EVERY order of the
+            period, every status (completed, shipping, cancelled, returned); returned orders are not cancelled. None when no
+            order was placed in the period. Train gold: 135 of 135 questions with a clear period."""
+            s, e = _ts(start), _ts(end) + pd.Timedelta(days=1)
+            w = orders[(orders["date"] >= s) & (orders["date"] < e)]
+            if not len(w):
+                return None
+            return round(float((w["status_std"] == "cancelled").sum()) / len(w) * 100, 2)
+        tools["cancel_rate"] = cancel_rate
+
     if orders is not None and "customer_key" in orders.columns:   # rulebook §3, see engines/orders.py
         def top_customers(k=None, start=None, end=None) -> list:
             """[(customer, revenue)] for valid orders placed in [start, end], largest first; one customer per customer
@@ -164,4 +176,18 @@ def build_tools(sales: SalesView | None, items: ItemView | None, debt: DebtView 
 
 TOOL_NAMES = ("sales_metrics", "find_items", "item_qty", "item_revenue", "item_base_unit", "top_items", "item_price_on",
               "item_qty_change", "size_qty", "debt_total", "debt_by_customer", "debt_customers", "debt_aging", "debt_repaid",
-              "debt_new", "top_customers", "purchase_total", "purchase_avg_price", "top_supplier", "sales_orders")
+              "debt_new", "top_customers", "purchase_total", "purchase_avg_price", "top_supplier", "cancel_rate", "sales_orders")
+
+# Engines that hard-code one rulebook row keep that row's defining words here. The split's rulebook may differ from the
+# training one (the public / private test rulebooks are not in the repo): when the words are gone, the engine is switched off
+# and the Coder computes from the tables, instead of an "exact" function silently applying an old rule.
+RULE_ANCHORS = {
+    "cancel_rate": ("phan tram don huy trong moi don dat trong ky", "moi trang thai"),
+}
+
+
+def rule_gated(rulebook: str) -> set[str]:
+    """Engine functions whose rulebook row (RULE_ANCHORS) is not in this rulebook: not offered to the Coder."""
+    from datamate.text import fold_text
+    text = fold_text(rulebook or "")
+    return {name for name, words in RULE_ANCHORS.items() if not all(w in text for w in words)}
