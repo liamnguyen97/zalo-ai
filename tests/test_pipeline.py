@@ -126,6 +126,19 @@ def test_debt_follows_rulebook_section_4():
     assert t["debt_new"]("2026-05-01", "2026-05-31") == 100 - 40 + 200 + 50 - 10
 
 
+def test_the_payment_method_column_is_found_by_the_readme_or_a_shared_name_pattern():
+    """B6: one payment-column definition for status and debt; `Thanh toán bằng` (dev_008's name) and a README-declared column count."""
+    base = _debt_biz()
+    for col, readme_line in (("Thanh toán bằng", ""), ("Kiểu", "\n## Cột trong `don_hang.csv`\n- **Mã đơn**: mã đơn\n- **Kiểu**: hình thức thanh toán của đơn\n"
+                                                          "- **Ngày**: ngày bán\n- **Tổng đơn**: tổng tiền\n- **Mã KH**: mã khách\n")):
+        orders = base.tables["don_hang"].rename(columns={"Phương thức": col})
+        v = build_debt(Business("b", base.readme + readme_line, {**base.tables, "don_hang": orders}))
+        assert v is not None and build_tools(None, None, v)["debt_total"]("2026-05-31") == 220, col     # same as with "Phương thức"
+    orders = base.tables["don_hang"].rename(columns={"Phương thức": "Kiểu"})                             # no README line, no pattern
+    v = build_debt(Business("b", base.readme, {**base.tables, "don_hang": orders}))
+    assert build_tools(None, None, v)["debt_total"]("2026-05-31") == 300      # unseen: the COD order O5 (80) is counted as owed (§4 says never)
+
+
 def test_repeated_lookups_are_not_rerun_and_a_spec_is_demanded():
     lk = {"lookups": [{"tool": "find_values", "args": {"text": "tiramisu"}}], "spec": None}
     m = Scripted(explain=[lk, lk, {"lookups": [], "spec": SPEC}], check=[{"clear": True, "issues": []}])

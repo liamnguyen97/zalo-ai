@@ -19,7 +19,7 @@ from typing import Any
 import re
 
 from datamate.engines.reference import Reference, agrees
-from datamate.text import fold_text
+from datamate.text import fold, fold_text
 
 LIST_TYPES = ("list", "string", "table")
 # a rewrite that talks about these is not a "quantity sold" question, whatever the spec's measure says (dev300: "ending inventory")
@@ -44,6 +44,27 @@ def _iso(ts) -> str:
     return str(ts)[:10]
 
 
+def _without_base_units(ents: list[dict], tools: dict) -> list[dict]:
+    """The entities without the ones that are the BASE unit of another (item) entity: "bao nhiêu cái Bánh tiramisu" gave the spec
+    `Bánh tiramisu` and `cái` (column `Đơn vị tính`, role item), so no hint was given (dev300 q_1885ab61433f: the hint is 89 =
+    the gold, the Coder said 83). The engine counts in base units, so that unit is no condition; another unit ("thùng" when the
+    base unit is "lon") stays an entity, and there is no hint."""
+    base = tools.get("item_base_unit")
+    if base is None or len(ents) < 2:
+        return ents
+    units = set()
+    for e in ents:
+        if e.get("role") != "item":
+            continue
+        try:
+            units.add(fold(str(base(e.get("value")))))
+        except Exception:  # noqa: BLE001 - not an item of the data: it has no base unit
+            continue
+    units.discard("")
+    units.discard("none")
+    return [e for e in ents if fold(str(e.get("value") or "")) not in units]
+
+
 def route(spec, tools: dict, start, end, question: str | None = None, compare: bool = False) -> Hint | None:
     """The one engine call that fits this spec, run on [start, end], or None. `start`/`end`: the main period (None = no period).
 
@@ -56,7 +77,7 @@ def route(spec, tools: dict, start, end, question: str | None = None, compare: b
     rewrite = (spec.rewritten_question or "")
     if question and fold_text(rewrite) == fold_text(question):
         return None         # the Explainer's fallback copied the question back: no usable spec, every wrong hint came from here
-    ents = [e for e in (spec.entities or []) if isinstance(e, dict)]
+    ents = _without_base_units([e for e in (spec.entities or []) if isinstance(e, dict)], tools)
     items = [e for e in ents if e.get("role") == "item"]
     s, e = _iso(start), _iso(end)
     atype, measure, k = spec.answer_type, spec.measure, spec.k

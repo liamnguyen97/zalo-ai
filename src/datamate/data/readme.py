@@ -37,6 +37,10 @@ ROLES: list[tuple[str, re.Pattern]] = [
     ("unit_price", re.compile(r"^đ[ơo]n gi[áa]$", re.I)),
     ("base_unit", re.compile(r"^đ[ơo]n v[ịi] c[ơo] b[ảa]n$", re.I)),
     ("item_group", re.compile(r"^nh[óo]m h[àa]ng$", re.I)),
+    # "mã khách (trống nếu khách lẻ)": the column is called `Mã người mua`, `Mã khách mua`, `Mã thẻ`..., the description is the standard one
+    ("customer_code", re.compile(r"^m[ãa] kh[áa]ch\b", re.I)),
+    # "hình thức thanh toán của đơn: cash tiền mặt, transfer chuyển khoản, ..." (dev_008's column is `Thanh toán bằng`)
+    ("payment_method", re.compile(r"^(?:h[ìi]nh th[ứu]c|ph[ưu][ơo]ng th[ứu]c) thanh to[áa]n\b", re.I)),
     ("conv_ratio", re.compile(r"^h[ệe] s[ốo]\b", re.I)),
     ("large_unit", re.compile(r"^đ[ơo]n v[ịi] l[ớo]n\b|^đ[ơo]n v[ịi] quy đ[ổo]i", re.I)),
 ]

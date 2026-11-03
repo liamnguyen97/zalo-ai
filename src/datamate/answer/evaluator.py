@@ -49,6 +49,9 @@ ISSUE_TEXT = {
     "engine_mismatch": "the exact engine function the explainer picked gives a different value: {ref}. Use the function (shape its "
                        "result as OUTPUT requires) unless the question has a condition it cannot express; if you keep your own "
                        "calculation, print one line saying why.",
+    "hint_mismatch": "the engine function under ENGINE HINT gives a different value: {hint}{hint_note}. Use it (shape its result as "
+                     "OUTPUT requires) unless the question has a condition it cannot express; if you keep your own calculation, print "
+                     "one line saying why.",
     "format": "the value cannot be put in the required answer form ({kind}). Return exactly the form in the OUTPUT section.",
     # audits of the turn's code (answer/audit.py), raised only with DATAMATE_AUDIT=on, said once
     "entity_absent": "the question names {names}, but no string in the code is that value: filter with `== <value>` exactly as "
@@ -56,6 +59,10 @@ ISSUE_TEXT = {
                      "another way, keep the calculation and print one line saying how.",
     "profit_bound": "{bound} Check the cost side: unit cost x quantity in the same unit, only the period's purchases / expenses, "
                     "only valid orders.",
+    "period_mismatch": "{mismatch} The Coder cannot change those periods: the spec must name the period the question asks for "
+                       "(rulebook §2 dates).",
+    "date_literal": "{stray} Filter with `period_start` / `period_end` (and `compare_start` / `compare_end`), do not type dates of "
+                    "your own; if the question needs another period, say which one in a printed line.",
 }
 
 def reshape_hint(expected: str | None, kind: str | None) -> str:
@@ -99,8 +106,56 @@ code as "cut off" or "incomplete". Criticise only errors visible in the logic.
   the error; "target" = "coder" if the error is in the calculation, "explainer" if the question was misread (wrong period,
   object or quantity already in the spec).
 - unanswerable: the data truly lacks the needed information (the code proved it: it printed the columns / date range).
-Return only JSON: {"verdict": "accept"|"revise"|"unanswerable", "target": "coder"|"explainer", "problem": "...",
-"fix": "...", "evidence": "<verbatim copy>"}"""
+Return only JSON: {"verdict": "accept"|"revise"|"unanswerable", "target": "coder"|"explainer", "evidence": "<verbatim copy>",
+"problem": "...", "fix": "..."}"""
+# DATAMATE_JUDGE_FORMAT=v1: the earlier key order. `problem` and `fix` came before `evidence`, so a reply cut by the output cap lost the
+# evidence first (dev300 2b4ca48e19: 8 of 287 replies cut, all read as "unreadable" = accept)
+JUDGE_SYSTEM_V1 = JUDGE_SYSTEM.replace(
+    '''"target": "coder"|"explainer", "evidence": "<verbatim copy>",
+"problem": "...", "fix": "..."}''', '''"target": "coder"|"explainer", "problem": "...",
+"fix": "...", "evidence": "<verbatim copy>"}''')
+_FIELD = {k: re.compile(rf'"{k}"\s*:\s*"((?:[^"\\]|\\.)*)"') for k in ("verdict", "target", "evidence", "problem", "fix")}
+
+
+# a label the judge puts before a quote ("VERIFIED FACTS: ...", "ENGINE VALUE: ...", "Code Output: ...")
+_LABEL = re.compile(r"^\s*(?:#\s*)?(?:verified facts|engine value|engine reference|engine hint|facts|output|printed output|code output|"
+                    r"code|question|original question|spec)\b[^:]{0,20}:\s*", re.I)
+
+
+def fact_fragments(evidence: str, facts: str) -> list[str]:
+    """The pieces of a judge's evidence that are VERBATIM in the code-computed FACTS / ENGINE VALUE. The judge often joins two quotes
+    with "..." or puts a label first ("VERIFIED FACTS: ... 19 ... ENGINE VALUE: item_qty(...) -> 32"): as a whole the evidence is
+    in no text and the revise was dropped (dev300 q_c4eee7e4ca8d, q_40de33fe6cdc: right diagnoses). Only the FACTS count: a piece found
+    in the question or the code alone is how format complaints about right answers got through when every piece was accepted."""
+    if not evidence or not facts:
+        return []
+    # the counts and values only: the "# VERIFIED FACTS (...)" / "# ENGINE VALUE (...)" headers are boilerplate a revise could copy, and
+    # so is a phrase every fact line has ("in the main period"): a piece counts only when it carries a number of the facts
+    body = "\n".join(line for line in facts.splitlines() if not line.lstrip().startswith("#"))
+    ff, numbers = fold_text(body), set(re.findall(r"\d+(?:[.,]\d+)*", body))
+    out = []
+    for part in re.split(r"\.\.\.|…|\bvs\.?\b", evidence):
+        p = _LABEL.sub("", part).strip(" \t\n.;,'\"")
+        if len(p.split()) >= 2 and fold_text(p) and fold_text(p) in ff and set(re.findall(r"\d+(?:[.,]\d+)*", p)) & numbers:
+            out.append(p)
+    return out
+
+
+def _partial_json(text: str) -> dict | None:
+    """The fields of a JSON reply cut before its end: each string value that is complete (its closing quote is there). None without a
+    complete `verdict`. A revise keeps its evidence only when the whole quote arrived, so the verbatim filter still decides."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    if "{" not in text or "}" in text[text.rfind("{"):]:
+        return None                                  # not cut: a JSON broken some other way is not read in pieces
+    out = {}
+    for k, rx in _FIELD.items():
+        m = rx.search(text)
+        if m:
+            try:
+                out[k] = json.loads(f'"{m.group(1)}"')
+            except ValueError:
+                out[k] = m.group(1)
+    return out if out.get("verdict") in ("accept", "revise", "unanswerable") else None
 
 
 @dataclass
@@ -142,9 +197,12 @@ def _last_code(steps: list, limit: int = 1500) -> str:
 
 
 class Evaluator:
-    def __init__(self, model, gate: bool = True, judge_unanswerable: bool = False, judge_facts: bool = True):
-        self.model, self.gate = model, gate
-        self.judge_unanswerable, self.judge_facts = judge_unanswerable, judge_facts
+    def __init__(self, model, gate: bool = True, judge_unanswerable: bool = False, judge_facts: bool = True,
+                 judge_periods: bool = False, max_tokens: int = 1500, judge_format: str = "v2", evidence: str = "fragments"):
+        self.model, self.gate, self.max_tokens = model, gate, max_tokens
+        self.judge_format = judge_format       # v2: evidence before problem / fix, a cut reply read up to the cut; v1: as before
+        self.evidence = evidence               # fragments: a revise whose evidence has pieces verbatim in the FACTS counts; strict: as before
+        self.judge_unanswerable, self.judge_facts, self.judge_periods = judge_unanswerable, judge_facts, judge_periods
 
     def evaluate(self, st, contract: str, steps: list, answered: bool, raw, interp, formatted: dict | None,
                  confirmed: str = "") -> Verdict:
@@ -171,14 +229,35 @@ class Evaluator:
             lines = [f"The previous turn returned {raw!r:.200} but a check rejected it:"]
             lines += ["- " + ISSUE_TEXT.get(i, i).format(expected=st.answer_type or "?", kind=interp.kind, k=getattr(st.brief, "k", None),
                                                   ref=getattr(getattr(st, "engine_ref", None), "text", ""),
+                                                  hint=getattr(getattr(st, "engine_hint", None), "text", ""),
+                                                  hint_note=(f" ({st.engine_hint.note})" if getattr(getattr(st, "engine_hint", None), "note", "") else ""),
                                                   reshape=reshape_hint(st.answer_type, interp.kind),
                                                   names=", ".join(repr(x) for x in audit.get("entity_absent") or []),
-                                                  bound=audit.get("profit_bound") or "")
+                                                  bound=audit.get("profit_bound") or "", mismatch=audit.get("period_mismatch") or "",
+                                                  stray=audit.get("date_literal") or "")
                       for i in issues]
-            return Verdict("revise", "checks", feedback="\n".join(lines) + "\n" + _last_code(steps))
+            # the periods are the spec's: the Coder cannot fix a mismatch (the harness protects `period_*`), the Explainer can
+            return Verdict("revise", "checks", "explainer" if "period_mismatch" in issues else "coder",
+                           "\n".join(lines) + "\n" + _last_code(steps))
         if confirmed:
             return Verdict("accept", "engine_agrees", feedback=f"equals the exact engine function: {confirmed}"[:400])
         return self._judge(st, contract, steps, raw, interp)
+
+    @staticmethod
+    def periods_text(st) -> str:
+        """The periods code computed, for the judge: the dates the question names (rulebook §2), the spec's periods, and the period
+        issues the spec stage could not settle. "" when there is none of them."""
+        named = [f"- {p.label}: {p.start} .. {p.end}" for p in getattr(st, "named_periods", None) or []]
+        spec = [f"- {p.role} {p.label!r}: {p.start} .. {p.end}" for p in getattr(getattr(st, "period", None), "periods", None) or []]
+        open_ = [i for i in getattr(getattr(st, "brief", None), "open_issues", None) or [] if str(i).startswith("periods:")]
+        if not (named or spec or open_):
+            return ""
+        lines = ["# PERIODS (computed by code, rulebook dates; the Coder's `period_*` / `compare_*` must be these)"]
+        lines += ["Named in the question:"] + (named or ["- (no calendar phrase)"])
+        lines += ["Periods of the spec:"] + (spec or ["- (none)"])
+        if open_:
+            lines += ["NOT SETTLED by the spec stage:"] + [f"- {i}" for i in open_]
+        return "\n".join(lines)
 
     @staticmethod
     def facts_text(st) -> str:
@@ -193,22 +272,30 @@ class Evaluator:
     def _judge(self, st, contract: str, steps: list, raw, interp, unanswerable: bool = False) -> Verdict:
         code = _last_code(steps, 6000)
         spec = getattr(st.brief, "rewritten_question", "") or "(none)"
-        facts = self.facts_text(st) if self.judge_facts else ""
+        facts = "\n\n".join(x for x in (self.facts_text(st) if self.judge_facts else "",
+                                         self.periods_text(st) if self.judge_periods else "") if x)
         user = (f"ORIGINAL QUESTION: {st.question}\nSPEC (English rewrite): {spec}\nas_of_date = {st.as_of}\n\n{contract}\n\n"
                 + (f"{facts}\n\n" if facts else "")
                 + f"LAST CODE RUN AND ITS RESULT:\n{code}\n\n"
                 + (f"THE CODE CONCLUDED UNANSWERABLE: {raw!r:.300}" if unanswerable
                    else f"ANSWER: {interp.kind} = {interp.raw!r:.300}"))
-        v = _json(chat(self.model, JUDGE_SYSTEM, user, stage="judge", max_tokens=800, context=getattr(st, "context", None)))
+        v2 = self.judge_format != "v1"
+        reply = chat(self.model, JUDGE_SYSTEM if v2 else JUDGE_SYSTEM_V1, user, stage="judge", max_tokens=self.max_tokens,
+                     context=getattr(st, "context", None))
+        v, cut = _json(reply), False
+        if v is None and v2 and (v := _partial_json(reply)) is not None:
+            cut = True                                   # the reply was cut: its complete fields only
         if v is None or v.get("verdict") not in ("accept", "revise", "unanswerable"):
             return Verdict("unanswerable" if unanswerable else "accept", "judge_ignored", feedback="(judge reply unreadable)")
         ev = str(v.get("evidence") or "").strip()
         target = v.get("target") if v.get("target") in ("coder", "explainer") else "coder"
-        feedback = f"{v.get('problem', '')} -> {v.get('fix', '')}".strip(" ->")
+        feedback = f"{v.get('problem', '')} -> {v.get('fix', '')}".strip(" ->") + (" [judge reply cut: read up to the cut]" if cut else "")
         if v["verdict"] == "revise":
             quote = fold_text(ev)
             found = next((name for name, text in (("question", st.question), ("code", code), ("facts", facts))
                           if quote and quote in fold_text(text)), "")
+            if not found and self.evidence == "fragments" and fact_fragments(ev, facts):
+                found = "facts_fragments"
             if not found:                                # no evidence: the checks in code passed, keep the answer
                 return Verdict("unanswerable" if unanswerable else "accept", "judge_ignored", target, feedback, ev)
             return Verdict("revise", "judge", target, f"Judge: {feedback} (\"{ev}\")\n{code}", ev, found)

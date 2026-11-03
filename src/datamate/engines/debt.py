@@ -21,14 +21,15 @@ import pandas as pd
 
 from datamate.answer.formatter import _clean_name
 from datamate.data.loader import Business
-from datamate.data.status import find_order_col
+from datamate.data.readme import roles_for_tables
+from datamate.data.status import PAYMENT_COL, find_order_col
 from datamate.text import fold
 
 DEBT_LINE = re.compile(r"\*\*C[ôo]ng n[ợo]\*\*\s*:(.*)$", re.I | re.M)
 NAMED = re.compile(r"\*\*([^*]+)\*\*|`([^`]+)`")
 CREDIT = {"ghi no", "debt", "cong no", "no", "tra sau", "mua chiu", "credit"}
 NOT_DEBT_CHANNEL = re.compile(r"cod|thu ho|shopee|lazada|tiki|tiktok|\bsan\b|tmdt|ecommerce|marketplace")
-METHOD_COL = re.compile(r"ph[ưu][ơo]ng th[ứu]c|pttt|httt|h[ìi]nh th[ứu]c|tr[ảa] b[ằa]ng|lo[ạa]i tt|phuongthuc|payment", re.I)
+METHOD_COL = PAYMENT_COL   # one definition with data/status.py (it also reads "Thanh toán bằng"); the README role `payment_method` comes first
 CHANNEL_COL = re.compile(r"k[êe]nh|ngu[ồo]n|b[áa]n qua|lo[ạa]i b[áa]n|channel|kenhbanhang|source", re.I)
 NAME_COL = re.compile(r"t[êe]n|name|kh[áa]ch h[àa]ng|^kh$|tengoi", re.I)
 DATE_COL = re.compile(r"th[ờo]i|ng[àa]y|date|time|gi[ờo]", re.I)
@@ -173,10 +174,26 @@ def _name_col(df: pd.DataFrame, avoid: str) -> str | None:
     return best[1] if best else None
 
 
+def _declared_code(biz: Business, octable: str, orders: pd.DataFrame) -> str | None:
+    """The column of the order table that the README documents as the customer code ("mã khách (trống nếu khách lẻ)"), when the orders
+    have it with at least two codes. dev_007 / dev_008 record the code on the order itself (190 / 210 customers); keyed by name and phone
+    they had 767 / 844 "customers", and "Th5 mấy khách mua từ 9 đơn" was 2 instead of 62."""
+    df = biz.tables.get(octable)
+    if df is None:
+        return None
+    col = roles_for_tables(biz.readme, {octable: list(df.columns)}).get(octable, {}).get("customer_code")
+    if col is None or col not in orders.columns:
+        return None
+    return col if _ids(orders[col].dropna()).replace("", pd.NA).dropna().nunique() >= 2 else None
+
+
 def _customer(biz: Business, orders: pd.DataFrame, octable: str) -> tuple[pd.Series, pd.Series]:
     """(customer key, display name) per order row. Shops with customer codes: one customer per code, name from the
     customer list (or the order's name column). Shops without codes: the name is the key, spelling-folded (§3)."""
     texts = _text_cols(orders)
+    declared = _declared_code(biz, octable, orders)
+    if declared is not None:
+        texts = [declared] + [c for c in texts if c != declared]      # the README's column first
     code_col, name_map = None, {}
 
     def search(need_hint: bool):
@@ -201,6 +218,8 @@ def _customer(biz: Business, orders: pd.DataFrame, octable: str) -> tuple[pd.Ser
     # 05a8b3 (gold unanswerable) was answered 98.33. Only a pair whose column / key / table name speaks of customers counts;
     # without one the shop has no customer codes (the order's own name column is tried next) and its orders are walk-ins
     code_col, name_map = search(True)
+    if declared is not None and code_col != declared:
+        code_col, name_map = declared, {}          # no customer list keyed by it: the names come from the order's own name column
     own_name = _name_col(orders.head(20000), code_col or "")
     if code_col is not None:
         key = _ids(orders[code_col]).where(orders[code_col].notna(), "")
@@ -238,7 +257,9 @@ def build_debt(biz: Business) -> DebtView | None:
     odate, pdate = _date_col(o), _date_col(p)
     if odate is None or pdate is None:
         return None
-    method = next((c for c in _text_cols(o) if METHOD_COL.search(c)), None)
+    declared = roles_for_tables(biz.readme, {ot: list(o.columns)}).get(ot, {}).get("payment_method")
+    texts = _text_cols(o)
+    method = declared if declared in texts else next((c for c in texts if METHOD_COL.search(c)), None)
     channel = next((c for c in _text_cols(o) if CHANNEL_COL.search(c)), None)
     mfold = o[method].map(fold) if method else pd.Series("", index=o.index)
     cfold = o[channel].map(fold) if channel else pd.Series("", index=o.index)

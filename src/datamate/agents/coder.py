@@ -212,8 +212,7 @@ def engine_first(plan: str, ref) -> tuple[str, bool]:
     fn = ref.call["function"]
     if fn in (plan or ""):
         return plan, False
-    args = ", ".join(f"{k}={v!r}" for k, v in ref.call["args"].items())
-    step = (f"0. FIRST call `{fn}({args})`: the exact engine function for this question (its value is under ENGINE REFERENCE); "
+    step = (f"0. FIRST call `{ref.expr}`: the exact engine function for this question (its value is under ENGINE REFERENCE); "
             "shape its result as OUTPUT requires. The steps below matter only for a condition that function cannot express.")
     return step + ("\n" + plan if plan else ""), True
 

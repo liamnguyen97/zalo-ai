@@ -106,7 +106,36 @@ class Settings:
     trust_repeat: bool = field(default_factory=lambda: _flag("DATAMATE_TRUST_REPEAT", True))
     judge_unanswerable: bool = field(default_factory=lambda: _flag("DATAMATE_JUDGE_UNANSWERABLE", False))
     judge_facts: bool = field(default_factory=lambda: _flag("DATAMATE_JUDGE_FACTS", True))
+    # The judge also reads the periods code computed (the dates the question names by the rulebook, the spec's periods, the period
+    # issues the spec stage left open), so it checks the Coder's dates against them instead of guessing them. OFF until measured.
+    judge_periods: bool = field(default_factory=lambda: _flag("DATAMATE_JUDGE_PERIODS", False))
+    # The judge's output cap. 800 cut 8 of 287 dev300 judge replies before their closing brace: read as "unreadable" = accept. A reply
+    # averages ~180 tokens, so a higher cap changes only the replies that were cut.
+    judge_max_tokens: int = field(default_factory=lambda: int(os.getenv("DATAMATE_JUDGE_MAX_TOKENS", "1500")))
+    # v2: the judge writes verdict, target and evidence before problem / fix, and a reply cut by the cap is read up to the cut (its
+    # complete fields; a revise still needs its whole verbatim evidence). v1: the earlier prompt and parser (A/B).
+    judge_format: str = field(default_factory=lambda: os.getenv("DATAMATE_JUDGE_FORMAT", "v2"))
+    # fragments: a judge revise also stands when its evidence, split at "..." and stripped of labels, has a piece verbatim in the
+    # code-computed FACTS / ENGINE VALUE (dev300: 2 right diagnoses on wrong answers were dropped). strict: the whole quote, as before.
+    judge_evidence: str = field(default_factory=lambda: os.getenv("DATAMATE_JUDGE_EVIDENCE", "fragments"))
     audit_mode: str = field(default_factory=lambda: os.getenv("DATAMATE_AUDIT", "shadow"))
+    # With DATAMATE_AUDIT=on, the audits listed here are still only logged (comma list: entity_absent, profit_bound, period_mismatch,
+    # date_literal). date_literal is a heuristic on the Coder's own dates: log it before enforcing it.
+    # Engine hints (engines/routing.py) the Coder is sent back on, once, when its value differs ("hint_mismatch", like engine_mismatch):
+    # only functions whose hint precision was measured high (dev300: item_qty 16/16). Never the whole-shop sales_metrics (64/91).
+    enforce_hints: tuple = field(default_factory=lambda: tuple(x.strip() for x in os.getenv("DATAMATE_ENFORCE_HINTS", "item_qty").split(",") if x.strip()))
+    audit_skip: tuple = field(default_factory=lambda: tuple(x.strip() for x in os.getenv("DATAMATE_AUDIT_SKIP", "date_literal").split(",") if x.strip()))
+
+    # Time budget (error-analysis P0). Rule 7: the whole private set within 6 h; Rule 8: if the run is cut, only the lines already
+    # in submission.jsonl are scored. A question that runs past `question_deadline_s` (p90 794 s, max 2218 s on public v3.5) stops
+    # before its next model call, and every request is cut at the time left. What it submits then: "checked" = the latest value
+    # that passed the checks in code (even if the judge had rejected it), "abstain" = nothing. `run_deadline_s` (0 = no limit) is
+    # the whole run's: with `run_quick_s` or less left, a question starts with one turn and no Explainer re-run; once it has passed,
+    # the questions still waiting are abstained without a model call.
+    question_deadline_s: float = field(default_factory=lambda: float(os.getenv("DATAMATE_QUESTION_DEADLINE_S", "900")))
+    run_deadline_s: float = field(default_factory=lambda: float(os.getenv("DATAMATE_RUN_DEADLINE_S", "0")))
+    run_quick_s: float = field(default_factory=lambda: float(os.getenv("DATAMATE_RUN_QUICK_S", "1800")))
+    deadline_fallback: str = field(default_factory=lambda: os.getenv("DATAMATE_DEADLINE_FALLBACK", "checked"))
 
     workers: int = field(default_factory=lambda: int(os.getenv("DATAMATE_WORKERS", "4")))
 

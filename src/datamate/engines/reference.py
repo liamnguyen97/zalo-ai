@@ -6,6 +6,14 @@ available functions, runs it, shows the Coder the value, and compares the Coder'
 Coder hand-built sums the engines already compute exactly (`debt_repaid` equals the gold on both debt-repayment questions it
 missed by ~1M; `top_items` equals the gold on 3 of 5 top-k questions the Coder ranked itself). The reference is a hint with
 one retry: a Coder that still disagrees after seeing it is trusted (the Explainer may have picked the wrong function).
+
+A call with an argument the function does not take is REPAIRED when the argument is a formality, else dropped (the reason is
+logged). dev300 run 2b4ca48e19: 120 of 242 calls were dropped whole, 64 for `sales_metrics(..., metric=...)`, with no trace; the
+Coder then rebuilt "how many orders today" by hand (0, the engine said 66). Formalities: `valid_only=True` (every engine counts
+valid orders only), a `metric` that names a key of the dict the function returns (`order_count` -> `['orders']`), a `unit` that is
+the item's base unit (the unit the engine counts in). Anything else is a condition the function cannot express (`shift`, `channel`,
+`metric='cancelled_orders'`...): without it the function gives the whole shop's figure. A repaired call is kept only for a plain
+number answer: a revenue is not the answer of a percent-change question.
 """
 from __future__ import annotations
 
@@ -19,6 +27,10 @@ import numpy as np
 
 from datamate.text import fold
 
+# `metric` values that name a key of the dict a function returns (sales_metrics): any other metric drops the call
+METRIC_KEYS = {"orders": "orders", "order_count": "orders", "n_orders": "orders", "num_orders": "orders", "total_orders": "orders",
+               "number_of_orders": "orders", "revenue": "revenue", "total_revenue": "revenue", "avg_order": "avg_order",
+               "avg_order_value": "avg_order", "average_order_value": "avg_order", "avg_revenue_per_order": "avg_order", "aov": "avg_order"}
 CALLS = ("sales_metrics", "item_qty", "item_revenue", "top_items", "item_price_on", "item_qty_change", "size_qty",
          "debt_total", "debt_by_customer", "debt_customers", "debt_aging", "debt_repaid", "debt_new", "top_customers",
          "purchase_total", "purchase_avg_price", "top_supplier", "cancel_rate")
@@ -29,11 +41,17 @@ DATE_ARGS = ("start", "end", "day")
 class Reference:
     call: dict
     value: Any
+    key: str | None = None      # the key of the dict the function returns that the value is (a repaired `metric`), else None
+
+    @property
+    def expr(self) -> str:
+        """The call as the Coder should write it, e.g. `sales_metrics(start='...', end='...')['orders']`."""
+        args = ", ".join(f"{k}={v!r}" for k, v in self.call["args"].items())
+        return f"{self.call['function']}({args})" + (f"[{self.key!r}]" if self.key else "")
 
     @property
     def text(self) -> str:
-        args = ", ".join(f"{k}={v!r}" for k, v in self.call["args"].items())
-        return f"{self.call['function']}({args}) -> {repr(self.value)[:400]}"
+        return f"{self.expr} -> {repr(self.value)[:400]}"
 
 
 def clean_call(call: Any) -> dict | None:
@@ -49,18 +67,62 @@ def clean_call(call: Any) -> dict | None:
     return {"function": call["function"], "args": dict(args)}
 
 
-def build_reference(call: Any, tools: dict) -> Reference | None:
-    """Run the call on this business's engine functions; None when it is malformed, unavailable or raises."""
-    call = clean_call(call)
-    fn = tools.get(call["function"]) if call else None
-    if fn is None:
-        return None
+def _is_base_unit(unit: Any, args: dict, tools: dict) -> bool:
+    base = tools.get("item_base_unit")
+    if base is None or not args.get("item") or not str(unit).strip():
+        return False
     try:
-        inspect.signature(fn).bind(**call["args"])
-        value = fn(**call["args"])
-    except Exception:  # noqa: BLE001 - a bad reference is dropped, never an error for the question
-        return None
-    return None if value is None else Reference(call, value)
+        return fold(str(base(args["item"]))) == fold(str(unit))
+    except Exception:  # noqa: BLE001 - an unknown item: not provably the base unit
+        return False
+
+
+def resolve_reference(call: Any, tools: dict, answer_type: str | None = None) -> tuple[Reference | None, str]:
+    """(reference, "") or (None, why the call was dropped). Arguments the function takes pass unchanged; the others are repaired
+    when they are formalities (module doc), else the call is dropped. A repaired call needs `answer_type` "number"."""
+    call = clean_call(call)
+    if call is None:
+        return None, "malformed call (unknown function, a list / dict argument or a date that is not YYYY-MM-DD)"
+    fn = tools.get(call["function"])
+    if fn is None:
+        return None, f"{call['function']} is not available for this shop"
+    params = inspect.signature(fn).parameters
+    open_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    args, key, repaired = {}, None, []
+    for k, v in call["args"].items():
+        if k in params or open_kw:
+            args[k] = v
+        elif k == "valid_only" and v is True:
+            repaired.append(k)
+        elif k == "metric" and str(v).strip().lower() in METRIC_KEYS:
+            key = METRIC_KEYS[str(v).strip().lower()]
+            repaired.append(k)
+        elif k == "unit" and _is_base_unit(v, call["args"], tools):
+            repaired.append(k)
+        else:
+            return None, f"argument {k}={v!r}: {call['function']} does not take it (a condition it cannot express)"
+    if repaired and answer_type != "number":
+        return None, f"repaired call ({', '.join(repaired)} removed) is used only for a number answer; the spec asks for {answer_type!r}"
+    try:
+        inspect.signature(fn).bind(**args)
+        value = fn(**args)
+    except Exception as e:  # noqa: BLE001 - a bad reference is dropped, never an error for the question
+        return None, f"the call raised {type(e).__name__}: {e}"[:300]
+    if key is not None:
+        if not isinstance(value, dict) or key not in value:
+            return None, f"metric {key!r} is not a key of what {call['function']} returns"
+        value = value[key]
+    if value is None:
+        return None, "the call returned None"
+    if repaired and _real(value) is None:
+        return None, "a repaired call must give one number"
+    return Reference({"function": call["function"], "args": args}, value, key), ""
+
+
+def build_reference(call: Any, tools: dict, answer_type: str | None = None) -> Reference | None:
+    """Run the call on this business's engine functions; None when it is malformed, unavailable, raises, or has an argument that
+    cannot be repaired (see resolve_reference)."""
+    return resolve_reference(call, tools, answer_type)[0]
 
 
 def _num(x) -> float | None:
@@ -136,4 +198,5 @@ def reference_note(ref: Reference) -> str:
             f"The explainer picked this engine call as computing exactly what the question asks: `{ref.text}`.\n"
             "Prefer it: assign `answer` from that call (e.g. `answer = <function>(<same arguments>)`, shaped as OUTPUT requires) "
             "instead of rebuilding the number by hand. Differ from it only when the question has a condition the function "
-            "cannot express, and print one line saying which.\n\n")
+            "cannot express, and print one line saying which.\n"
+            + (f"The function returns a dict: the value is its `[{ref.key!r}]`.\n" if ref.key else "") + "\n")

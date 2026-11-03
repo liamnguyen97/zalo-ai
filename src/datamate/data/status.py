@@ -15,9 +15,30 @@ import unicodedata
 
 import pandas as pd
 
+# "khách trả" is a return ("khách trả 1 món") but also a PAYMENT: "khách trả 300.000, còn thiếu 200.000", "khách trả trước", "ghi nợ, khách trả sau",
+# "khách trả tiền mặt", "ghi sổ, khách trả hết rồi". Those are told by what follows: a when / how / how much, not a thing given back
+# when / how much (the error analysis's list): "trả trước / sau / hết / đủ / góp", "trả 300.000 / 500k / 1tr5"
+_PAID_WHEN = r"(?:truoc|sau|tien|het|no|gop|du|them|roi|luon|xong|ngay|bang)\b"
+_PAID_AMOUNT = r"(?:\d{1,3}(?:[.,]\d{3})+|\d{4,}|\d+(?:[.,]\d+)?\s*(?:k|d|tr|trieu|nghin|ngan|dong|vnd)\d*)\b"
+# how: the payment methods. The shop's own labels come from its data (`payment_labels`: the values of its payment-method column);
+# these are the methods of the rulebook every shop has. The lexicon's "ck" / "tm" are written in full before classifying.
+PAYMENT_METHODS = ("tien mat", "chuyen khoan", "vi dien tu", "the", "cod", "ghi no")
+# a payment-method column by its name (the README role `payment_method` declares the others: dev_008's `Thanh toán bằng`)
+PAYMENT_COL = re.compile(r"ph[ưu][ơo]ng th[ứu]c|pttt|httt|h[ìi]nh th[ứu]c|tr[ảa] b[ằa]ng|thanh to[áa]n b[ằa]ng|lo[ạa]i tt|phuongthuc|payment",
+                         re.I)
+
+
+def _customer_returns(labels=()) -> str:
+    how = "|".join(re.escape(x) for x in sorted({*PAYMENT_METHODS, *labels}, key=len, reverse=True))
+    return rf"khach (?:mang )?tra\b(?! (?:{_PAID_WHEN}|{_PAID_AMOUNT}|(?:{how})\b))"
+
+
+CUSTOMER_RETURNS = _customer_returns()
+_RETURNED = r"tra hang|tra lai|hoan hang|hoan tra|doi tra|hang tra ve|returned?\b|{customer}|tra ve"
+
 # Order matters: the first matching rule wins. Patterns run on lowercase, diacritic-free text.
 RULES: list[tuple[str, str]] = [
-    ("returned", r"tra hang|tra lai|hoan hang|hoan tra|doi tra|hang tra ve|returned?\b|khach (?:mang )?tra\b|tra ve"),
+    ("returned", _RETURNED.format(customer=CUSTOMER_RETURNS)),
     ("cancelled", r"\bhuy|cancel|khong giao duoc|giao that bai"),
     ("shipping", r"dang (?:giao|van chuyen|gui|ship|xu ly)|cho giao|chua giao|shipping|in transit|dang giao dich"),
     ("completed", r"hoan thanh|\bxong\b|da giao|da lay|completed|thanh cong|\bok\b|success|da nhan|da thanh toan"),
@@ -49,11 +70,40 @@ def _nodia(s: str) -> str:
     return "".join(c for c in s if unicodedata.category(c) != "Mn").replace("đ", "d")
 
 
-def classify(value) -> str | None:
+def rules_for(payment_labels=()) -> list[tuple[str, str]]:
+    """RULES with the shop's payment labels among the payment words after "khách trả": "khách trả momo" is a payment in a shop that
+    takes MoMo, "khách trả 2 cái" stays a return."""
+    labels = tuple(sorted({x for x in payment_labels if x}))
+    if not labels:
+        return RULES
+    return [("returned", _RETURNED.format(customer=_customer_returns(labels)))] + RULES[1:]
+
+
+def payment_labels(tables: dict, roles: dict | None = None) -> set[str]:
+    """The shop's payment methods as its data writes them (folded): the values of each payment-method column (by name, or declared by
+    the README role `payment_method`) that has at most 40 labels. "Thu hộ (COD)" gives "thu ho cod", "thu ho" and "cod"."""
+    out: set[str] = set()
+    for t, df in tables.items():
+        declared = (roles or {}).get(t, {}).get("payment_method")
+        for c in df.columns:
+            if (c != declared and not PAYMENT_COL.search(str(c))) or df[c].dtype.kind in "iufbM":
+                continue
+            u = df[c].dropna().astype(str).unique()
+            if not 1 <= len(u) <= 40:
+                continue
+            for v in u:
+                f = _nodia(v).strip()
+                out.add(" ".join(re.sub(r"[^\w ]+", " ", f).split()))
+                out |= {" ".join(part.split()) for part in re.split(r"[()/,;]", f) if part.strip()}
+    return {x for x in out if len(x) >= 2}
+
+
+def classify(value, rules: list[tuple[str, str]] | None = None) -> str | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
-    t = _nodia(value)
-    for cls, pat in RULES:
+    from datamate import lexicon      # "khách trả ck" -> "khách trả chuyen khoan": the lexicon's abbreviations, written in full
+    t = lexicon.apply_folded(_nodia(value))
+    for cls, pat in rules or RULES:
         if re.search(pat, t):
             return cls
     return None
@@ -69,16 +119,17 @@ def _order_runs(df: pd.DataFrame) -> pd.Series | None:
     return (ids != ids.shift()).cumsum()
 
 
-def add_status_std(df: pd.DataFrame, prefer: str | None = None) -> pd.DataFrame:
+def add_status_std(df: pd.DataFrame, prefer: str | None = None, payment: set[str] | None = None) -> pd.DataFrame:
     """Add `status_std` (completed/shipping/cancelled/returned) when the table has a status column.
 
     `prefer`: the column the README documents as "trạng thái đơn". It is used even when its name matches no status
     pattern (`TT đơn`), as long as most of its labels are recognised.
     """
     best = None
+    rules = rules_for(payment or ())
     if prefer in df.columns and df[prefer].dtype.kind not in "iufM":
         vc = df[prefer].dropna().astype(str).value_counts()
-        mapping = {v: classify(v) for v in vc.index}
+        mapping = {v: classify(v, rules) for v in vc.index}
         if len(vc) and len(vc) <= 40 and sum(n for v, n in vc.items() if mapping[v]) / vc.sum() >= 0.5:
             best = ((2.0, 0), prefer, mapping, bool(NOTE_COL.search(prefer)))
     for col in df.columns:
@@ -89,7 +140,7 @@ def add_status_std(df: pd.DataFrame, prefer: str | None = None) -> pd.DataFrame:
         vc = df[col].dropna().astype(str).value_counts()
         if vc.empty or len(vc) > 40:
             continue
-        mapping = {v: classify(v) for v in vc.index}
+        mapping = {v: classify(v, rules) for v in vc.index}
         note = bool(NOTE_COL.search(col))
         hit = sum(n for v, n in vc.items() if mapping[v])
         non_completed = sum(n for v, n in vc.items() if mapping[v] and mapping[v] != "completed")

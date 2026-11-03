@@ -23,7 +23,7 @@ from datetime import date
 import pandas as pd
 
 from datamate.agents.lookups import DataTools
-from datamate.agents.periods import fix_calendar_period
+from datamate.agents.periods import fix_calendar_period, unmatched_periods
 from datamate.context import Period, Resolved
 from datamate.data.structure import resolve_table
 from datamate.engines.reference import clean_call
@@ -607,7 +607,8 @@ def code_checks(s: Spec, facts, question: str) -> tuple[list[str], list[str]]:
         else:
             notes.append(f"harness: answer_type {s.answer_type} -> {r.answer_type} (question wording: {r.rule})")
             s.answer_type = r.answer_type
-    if r is not None and r.k and s.answer_type in ("list", "table") and s.k != r.k:
+    if r is not None and r.sure and r.k and s.answer_type in ("list", "table") and s.k != r.k:
+        # only a reading that is sure: "tháng 1/26 sp nào" read as k=26 under the default reading ruined a one-name answer
         notes.append(f"harness: k {s.k} -> {r.k} (question wording)")
         s.k = r.k
     if s.answer_type == "string" and s.k and s.k > 1:
@@ -625,10 +626,12 @@ def code_checks(s: Spec, facts, question: str) -> tuple[list[str], list[str]]:
         w = fold_text(str(e.get("value"))).split()
         if w and sum(x in qn for x in w) < max(1, (len(w) + 1) // 2):
             issues.append(f"entities: {e.get('value')!r} is not named by the question; keep only what the question names")
-    # a calendar phrase of the question with no period of the spec covering it
-    for p in facts.periods:
-        if not any(str(x.get("start"))[:10] <= str(p.start) and str(p.end) <= str(x.get("end"))[:10] for x in s.periods):
-            issues.append(f"periods: the question names {p.label} ({p.start}..{p.end}) and no spec period covers it")
+    # a calendar phrase of the question with no period of the spec covering it. Covering = the same dates (or the union of several named
+    # periods that follow each other): a spec quarter that merely contains the month the question names does not cover it. Where a spec
+    # period may be wider than the phrase (a balance "đến hết tháng 5", "từ tháng 3 đến tháng 5", "7 ngày"), containing it is enough
+    spans = [(str(x.get("start"))[:10], str(x.get("end"))[:10]) for x in s.periods]
+    for p, strict in unmatched_periods(question, facts.periods, spans):
+        issues.append(f"periods: the question names {p.label} ({p.start}..{p.end}) and no spec period " + ("equals it" if strict else "covers it"))
     return notes, issues
 
 
@@ -869,6 +872,7 @@ class ExplainerAgent:
         from datamate.agents.question import read_question
         tools = DataTools(st.ctx.tables, self.calendar, getattr(st.ctx, "structure", None))
         facts = read_question(st.question, st.as_of, st.ctx.tables)
+        st.named_periods = list(facts.periods)
         system = SYSTEM_FAST + (METHOD_FIELD if self.plan_mode == "spec" else "")
         user = self._fast_prompt(st, facts, tools)
         if feedback:

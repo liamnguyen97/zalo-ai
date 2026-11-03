@@ -118,6 +118,56 @@ def test_only_adjacent_exact_duplicates_are_dropped(tmp_path):
     assert df["Hàng"].tolist() == ["x", "y", "x", "y", "x", "z", "w"] and any("duplicate" in n for n in biz.notes)
 
 
+def test_an_order_level_table_drops_a_row_identical_to_the_one_before_order_id_included(tmp_path):
+    """dev_009: one row per invoice, 308 of them written twice in a row by the export (May-2025 revenue was 504.395.000, not 500.782.000)."""
+    d = tmp_path / "biz"; d.mkdir()
+    ids = [f"HD{i:03d}" for i in range(40)]
+    rows = [(i, 100 + n) for n, i in enumerate(ids)]
+    rows.insert(11, rows[10])                   # an invoice written twice in a row: one is an export error
+    rows.insert(30, rows[5])                    # the same invoice far from its twin is not an adjacent repeat: kept
+    pd.DataFrame({"Mã hóa đơn": [r[0] for r in rows], "Giá trị hàng": [r[1] for r in rows]}).to_csv(d / "hoa_don_2026.csv", index=False)
+    biz = load_business(d)
+    (df,) = biz.tables.values()
+    assert len(df) == 41 and df["Giá trị hàng"].sum() == sum(100 + n for n in range(40)) + 105
+    assert any("removed 1 adjacent duplicate" in n for n in biz.notes)
+
+
+def test_two_invoices_with_the_same_amount_are_not_duplicates(tmp_path):
+    d = tmp_path / "biz"; d.mkdir()
+    pd.DataFrame({"Mã hóa đơn": [f"HD{i:03d}" for i in range(30)], "Giá trị hàng": [50] * 30}).to_csv(d / "hoa_don_2026.csv", index=False)
+    biz = load_business(d)
+    (df,) = biz.tables.values()
+    assert len(df) == 30 and not any("duplicate" in n for n in biz.notes)
+
+
+def test_a_customer_paying_is_not_a_return_but_a_customer_giving_goods_back_is():
+    """status.py: "khách trả" in a note. A payment (when / how / how much) must not take the order out of the revenue."""
+    from datamate.data.status import classify
+    for note in ("khách trả 300.000, còn thiếu 200.000", "khách trả trước 1tr", "ghi nợ, khách trả sau", "khách trả tiền mặt",
+                 "ghi sổ, khách trả hết rồi", "khách trả 500k", "khách trả 1tr5", "khách trả 250000", "khách trả bằng chuyển khoản"):
+        assert classify(note) is None, note
+    for note in ("khách trả 1 món", "Khách trả 2 cái", "trả hàng một phần", "khách mang trả", "khách trả lại hàng", "Khách trả"):
+        assert classify(note) == "returned", note
+
+
+def test_the_payment_words_after_khach_tra_include_the_shops_own_labels(tmp_path):
+    """B2: the payment methods come from the shop's data (its payment-method column), not from a list of guesses in the code."""
+    from datamate.data.status import classify, payment_labels, rules_for
+    assert classify("khách trả ck") is None and classify("khách trả tm") is None             # the lexicon's abbreviations
+    assert classify("khách trả momo") == "returned"                                          # a shop that has no MoMo: not a method
+    paid = payment_labels({"don": pd.DataFrame({"Thanh toán bằng": ["Tiền mặt", "Thu hộ (COD)", "MoMo"]})})
+    assert {"momo", "tien mat", "thu ho", "cod"} <= paid
+    assert classify("khách trả momo", rules_for(paid)) is None and classify("khách trả 2 cái", rules_for(paid)) == "returned"
+    # end to end: the README declares the payment column (its name matches no pattern), a note "khách trả momo" stays a sale
+    d = tmp_path / "biz"; d.mkdir()
+    (d / "README.md").write_text("## Cột trong `don.csv`\n- **Cách trả**: hình thức thanh toán của đơn\n- **Mã đơn**: mã đơn\n"
+                                 "- **Ghi chú**: ghi chú\n", encoding="utf-8")
+    pd.DataFrame({"Mã đơn": ["A", "B", "C"], "Cách trả": ["MoMo", "Tiền mặt", "MoMo"],
+                  "Ghi chú": ["khách trả momo", "khách trả 2 cái", None]}).to_csv(d / "don.csv", index=False)
+    (df,) = load_business(d).tables.values()
+    assert df["status_std"].tolist() == ["completed", "returned", "completed"]
+
+
 def test_money_shorthand_with_decimal_comma_and_underscore_status(tmp_path):
     d = tmp_path / "biz"; d.mkdir()
     pd.DataFrame({

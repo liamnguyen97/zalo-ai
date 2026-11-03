@@ -12,7 +12,9 @@ from __future__ import annotations
 import collections
 import hashlib
 import json
+import os
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +30,48 @@ def code_fingerprint() -> str:
         h.update(p.relative_to(SRC).as_posix().encode())
         h.update(p.read_bytes())
     return h.hexdigest()[:10]
+
+
+class SubmissionWriter:
+    """`submission.jsonl` kept complete up to the last finished question (README Rule 8: when a run is cut by the time limit or
+    killed, only the lines already in the file are scored, the rest count as abstain).
+
+    Every `add` rewrites the whole file to a temporary file next to it, fsyncs it and swaps it in with `os.replace`: the file on
+    disk is always a whole set of valid lines in the questions' order, never a torn last line, and a question has exactly one
+    line (appending would give a duplicate id when a question is redone). A question missing from the file is an abstain for the
+    scorer (README: "Questions missing from the file are scored as abstain"), so unfinished ones are not written as such.
+    A thousand rewrites of a thousand short lines cost about a second in all.
+    """
+
+    def __init__(self, path: str | Path, ids: list[str], keep_existing: bool = False):
+        self.path, self.rank = Path(path), {qid: n for n, qid in enumerate(ids)}
+        self.lines: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        if keep_existing and self.path.exists():     # resuming: lines of an earlier attempt stay until their question is done again
+            for raw in self.path.read_text(encoding="utf-8").splitlines():
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and d.get("id") in self.rank:
+                    self.lines[d["id"]] = d
+
+    def add(self, line: dict) -> None:
+        with self._lock:
+            self.lines[line["id"]] = line
+            self._write()
+
+    def _write(self) -> None:
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for qid in sorted(self.lines, key=self.rank.__getitem__):
+                f.write(json.dumps(self.lines[qid], ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+
+    def __len__(self) -> int:
+        return len(self.lines)
 
 
 def slug(name: str) -> str:

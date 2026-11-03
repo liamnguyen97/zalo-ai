@@ -137,6 +137,9 @@ class QAState:
     guideline: list = field(default_factory=list)   # agents/guideline.Entry: rulebook rows for this question, before OUTPUT
     facts: str = ""                 # VERIFIED FACTS: counts computed from the data for this question's periods / values
     audit: dict = field(default_factory=dict)       # answer/audit.py: the code audits that fired on the current turn
+    quick: bool = False             # the run is nearly out of time: one turn, no Explainer re-run (config.run_quick_s)
+    best: Any = None                # the latest submission line that passed the checks in code (what a deadline falls back to)
+    named_periods: list = field(default_factory=list)   # agents/question.PeriodMention: the calendar phrases of the question, rulebook dates
 
     @property
     def question(self) -> str:

@@ -18,6 +18,30 @@ from datamate.config import Settings
 
 _usage = threading.local()  # each question runs in one worker thread
 
+MIN_CALL_S = 5.0            # a model call is never given less than this once the budget still has time left
+
+
+class DeadlineExceeded(Exception):
+    """The question's time budget ran out (DATAMATE_QUESTION_DEADLINE_S, or the run's: DATAMATE_RUN_DEADLINE_S). Raised before a
+    model call is made, never in the middle of one: a thread cannot be interrupted, so every call is also given a request
+    timeout of the time that is left (UsageModel.generate)."""
+
+
+def set_deadline(at: float | None) -> None:
+    """The time (time.monotonic()) this thread's question must be answered by; None = no limit."""
+    _usage.deadline = at
+
+
+def time_left() -> float | None:
+    at = getattr(_usage, "deadline", None)
+    return None if at is None else at - time.monotonic()
+
+
+def check_deadline(what: str = "") -> None:
+    left = time_left()
+    if left is not None and left <= 0:
+        raise DeadlineExceeded(f"the time budget of the question is used up{f' (before {what})' if what else ''}")
+
 
 def set_session(session_id: str | None) -> None:
     """Sticky-routing key for this thread's requests (OpenRouter `x-session-id`): follow-up requests of the
@@ -69,6 +93,9 @@ class UsageModel(OpenAIModel):
         sid = getattr(_usage, "session", None)
         if self.sticky_sessions and sid:
             kwargs.setdefault("extra_headers", {"x-session-id": sid[:256]})
+        left = time_left()
+        if left is not None:      # a request that outlives the question's budget (600 s by default) is cut at the budget
+            kwargs["timeout"] = max(MIN_CALL_S, left)
         msg = super().generate(*args, **kwargs)
         _record(getattr(msg, "raw", None))
         return msg
@@ -129,8 +156,15 @@ def chat(model: OpenAIModel, system: str, user: str, temperature: float | None =
         kw["temperature"] = temperature
     if max_tokens is not None and isinstance(model, OpenAIModel):      # scripted test models take no generation options
         kw["max_tokens"] = max_tokens
+    check_deadline(stage)
     before, t0 = get_usage(), time.time()
-    content = model.generate(messages, **kw).content
+    try:
+        content = model.generate(messages, **kw).content
+    except Exception as e:  # noqa: BLE001 - a request cut by the budget's timeout is the budget running out, not a model failure
+        left = time_left()
+        if left is not None and left <= MIN_CALL_S:
+            raise DeadlineExceeded(f"a model call ({stage}) was still running when the time budget ended: {type(e).__name__}") from e
+        raise
     after = get_usage()
     out_tok = after["output_tokens"] - before["output_tokens"]
     defaults = getattr(model, "kwargs", None)

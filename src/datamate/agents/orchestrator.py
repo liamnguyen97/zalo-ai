@@ -33,10 +33,11 @@ from datamate.engines.functions import TOOL_NAMES, rule_gated
 from datamate.data.onboarding import summary
 from datamate.agents.coverage import no_identified_customers, period_outside_data
 from datamate.agents.shared import shared_context
-from datamate.engines.reference import Reference, agrees, build_reference, confirms
+from datamate.engines.reference import Reference, agrees, confirms, resolve_reference
 from datamate.engines.routing import route
-from datamate.llm import chat
+from datamate.llm import DeadlineExceeded, chat, check_deadline
 from datamate.sandbox.runner import Runner, RunResult
+from datamate.text import fold
 
 REPEAT_TEMPERATURE = 0.5     # Coder temperature after it resubmitted a block it had already run (otherwise 0: reproducible)
 STUCK_LIMIT = 2              # blocks that repeat a block or the previous error before the turn ends early
@@ -136,7 +137,9 @@ class Orchestrator:
                  max_turns: int = 3, coder_steps: int = 6, explainer_reruns: int = 1,
                  use_selector: bool = True, decide_after_explainer: bool = True, shared_prefix: bool = False,
                  guideline_rows: int = 4, verified_facts: bool = True, decide_mode: str = "rule",
-                 skip_judge_on_engine: bool = False, trust_repeat: bool = True, audit_mode: str = "shadow"):
+                 skip_judge_on_engine: bool = False, trust_repeat: bool = True, audit_mode: str = "shadow",
+                 deadline_fallback: str = "checked", audit_skip: tuple[str, ...] = ("date_literal",),
+                 enforce_hints: tuple[str, ...] = ("item_qty",)):
         self.model, self.col_selector, self.explainer, self.coder, self.evaluator = model, col_selector, explainer, coder, evaluator
         self.inputs, self.rulebook = inputs, rulebook
         self.max_turns, self.coder_steps, self.explainer_reruns = max_turns, coder_steps, explainer_reruns
@@ -154,6 +157,9 @@ class Orchestrator:
         # Coder returned unchanged is trusted (said once, like engine_mismatch); the code audits (answer/audit.py): off | shadow | on
         self.decide_mode, self.skip_judge_on_engine, self.trust_repeat = decide_mode, skip_judge_on_engine, trust_repeat
         self.audit_mode = audit_mode
+        self.audit_skip = set(audit_skip)       # audits that are only logged even with audit_mode "on"
+        self.enforce_hints = set(enforce_hints)  # engine hints the Coder is sent back on once when it differs (precision measured)
+        self.deadline_fallback = deadline_fallback     # what a question that runs out of time submits: "checked" | "abstain"
 
     # ------------------------------------------------------------------ bookkeeping
     def _call(self, st, agent: str, fn, **info):
@@ -190,6 +196,16 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ the loop
     def run(self, st) -> dict:
+        """The question's answer line (without the id). Time: llm.py raises DeadlineExceeded before the model call that would start
+        after the question's budget; the line is then the latest value that passed the checks in code (`st.best`), else an abstain."""
+        try:
+            return self._run(st)
+        except DeadlineExceeded as e:
+            best = getattr(st, "best", None) if self.deadline_fallback == "checked" else None
+            st.log.setdefault("orchestrator", []).append({"deadline": str(e)[:200], "submitted": "the latest checked value" if best else "abstain"})
+            return best or {"type": "abstain"}
+
+    def _run(self, st) -> dict:
         st.log["orchestrator"], turns = [], []
         st.log["turns"] = turns
         if self.use_selector:
@@ -203,7 +219,11 @@ class Orchestrator:
             st.functions = []
         st.context = (shared_context(self.rulebook, st.ctx.readme, st.schema, st.functions) if self.shared_prefix else None)
         self._call(st, "explainer", lambda: self.explainer.run(st))
-        reruns = self.explainer_reruns
+        # a run nearly out of time (config.run_quick_s): one turn and no Explainer re-run (local: the Orchestrator is shared by the workers)
+        quick = getattr(st, "quick", False)
+        max_turns, reruns = (1, 0) if quick else (self.max_turns, self.explainer_reruns)
+        if quick:
+            st.log["orchestrator"].append({"quick": "the run is nearly out of time: one turn, no Explainer re-run"})
         if self.decide_after_explainer:
             d = self.decide(st, "after_explainer: use this spec or rewrite it?", ["coder"] + (["explainer"] if reruns else []),
                             "coder", turns)
@@ -218,7 +238,8 @@ class Orchestrator:
         elif d.message:
             feedback = f"Orchestrator: {d.message}"
 
-        for turn in range(1, self.max_turns + 1):
+        for turn in range(1, max_turns + 1):
+            check_deadline("turn")
             variables = self.inputs.variables(st)
             for name in self.gated:
                 variables.pop(name, None)
@@ -227,8 +248,11 @@ class Orchestrator:
             if ob is not None:
                 st.log["onboarding"] = summary(ob)
             # the reference is an "exact" number: not shown when the shop's engines failed their invariants (mis-detection)
-            st.engine_ref = (build_reference(getattr(st.brief, "engine_call", None), variables)
-                             if ob is None or ob.get("trusted") else None)
+            call = getattr(st.brief, "engine_call", None)
+            st.engine_ref, dropped = (resolve_reference(call, variables, st.answer_type) if call and (ob is None or ob.get("trusted"))
+                                      else (None, "the shop's engines failed their invariants" if call else ""))
+            if dropped and not any("engine_call_dropped" in e for e in st.log["orchestrator"]):
+                st.log["orchestrator"].append({"engine_call_dropped": dropped, "call": call, "turn": turn})   # was silent
             # an advisory hint from the spec's shape when the Explainer named no call (it leaves it null on the standard shapes)
             st.engine_hint = (route(st.brief, variables, variables.get("period_start"), variables.get("period_end"), st.question)
                               if st.engine_ref is None and (ob is None or ob.get("trusted")) else None)
@@ -248,7 +272,7 @@ class Orchestrator:
             st.facts = verified_facts(st.question, st.brief, variables) if self.verified_facts else ""
             st.log.setdefault("coder_inputs", []).append({
                 "turn": turn, "guideline": [f"{e.source}: {e.label or e.text[:60]}" for e in st.guideline],
-                "facts": len(st.facts.splitlines()) - 1 if st.facts else 0})
+                "facts": len(st.facts.splitlines()) - 1 if st.facts else 0, **({"facts_text": st.facts[:3000]} if st.facts else {})})
             task = build_task(st, self.rulebook, have)
             _, contract = coder_brief(st.brief)
             steps = self._code_and_run(st, turn, task, variables, feedback)
@@ -265,9 +289,13 @@ class Orchestrator:
                     interp = Interpretation(st.answer_type or "string", raw, ["type"])
                 if interp.issues == ["zero"] and any(t.get("issues") == ["zero"] for t in turns):
                     interp.issues = []     # a 0 sent back once and returned again after re-checking the filters is the data's
-                if st.engine_hint is not None and interp.kind != "unanswerable":       # measured, not enforced
-                    st.log.setdefault("routing", []).append({"turn": turn, "hint": st.engine_hint.text[:200],
-                                                             "agrees": st.engine_hint.agrees_with(interp.raw)})
+                if st.engine_hint is not None and interp.kind != "unanswerable":       # measured; enforced for the functions listed
+                    hint_ok = st.engine_hint.agrees_with(interp.raw)
+                    enforce = self._enforced_hint(st, variables)
+                    st.log.setdefault("routing", []).append({"turn": turn, "hint": st.engine_hint.text[:200], "agrees": hint_ok,
+                                                             **({"enforced": True} if enforce else {})})
+                    if enforce and not hint_ok and not any("hint_mismatch" in t.get("issues", []) for t in turns):
+                        interp.issues = [*interp.issues, "hint_mismatch"]      # said once, like engine_mismatch
                 if (st.engine_ref is not None and interp.kind != "unanswerable" and not agrees(st.engine_ref, interp.raw)
                         and not any("engine_mismatch" in t.get("issues", []) for t in turns)):
                     interp.issues = [*interp.issues, "engine_mismatch"]        # said once: a Coder that keeps its value is trusted
@@ -281,12 +309,18 @@ class Orchestrator:
             st.audit = {}                                                      # AUDIT (answer/audit.py), before the verdict
             if self.audit_mode != "off" and interp is not None and interp.kind != "unanswerable":
                 st.audit = audit_turn(st.question, st.brief, interp.kind, interp.raw,
-                                      [r.code for r in steps if r.code and not r.refused], variables)
+                                      [r.code for r in steps if r.code and not r.refused], variables,
+                                      named=getattr(st, "named_periods", None) or [],
+                                      periods=list(getattr(getattr(st, "period", None), "periods", None) or []), as_of=st.as_of)
                 if st.audit:
                     st.log["orchestrator"].append({"audit": st.audit, "mode": self.audit_mode, "turn": turn})
                 if self.audit_mode == "on":                                    # an issue, said once like engine_mismatch
                     said = {i for t in turns for i in t.get("issues") or []}
-                    interp.issues = [*interp.issues, *(k for k in st.audit if k not in said and k not in interp.issues)]
+                    # a period the Coder cannot change goes back to the Explainer: only while a re-run is left (else it would waste a turn)
+                    interp.issues = [*interp.issues, *(k for k in st.audit if k not in said and k not in interp.issues
+                                                       and k not in self.audit_skip and (k != "period_mismatch" or reruns > 0))]
+            if interp is not None and formatted is not None and interp.kind != "unanswerable" and not interp.issues:
+                st.best = formatted                                            # what a deadline falls back to: passed every check in code
             # computed whatever the switches say and logged, so a run with a switch off still measures what it would have done
             confirmed, repeat = self._engine_confirms(st, interp), self._vetoed_before(interp, formatted, turns)
             if confirmed:
@@ -305,11 +339,11 @@ class Orchestrator:
                           "submit": formatted, "verdict": verdict.as_log(), **({"audit": st.audit} if st.audit else {})})
             if verdict.decision in ("accept", "unanswerable") and formatted is not None:
                 return formatted
-            if turn == self.max_turns:
+            if turn == max_turns:
                 break
             allowed = ["coder", "abstain"] + (["explainer"] if reruns else [])
             default = verdict.target if verdict.target in allowed else "coder"
-            d = self.decide(st, f"after_evaluator (turn {turn}/{self.max_turns} was rejected)", allowed, default, turns,
+            d = self.decide(st, f"after_evaluator (turn {turn}/{max_turns} was rejected)", allowed, default, turns,
                             rule=decide_by_rule(turns, allowed))
             if d.action == "abstain":
                 break
@@ -323,6 +357,24 @@ class Orchestrator:
                 note = f"Turn {turn}: {verdict.feedback}" + (f"\nOrchestrator: {d.message}" if d.message else "")
                 feedback = (feedback + "\n\n" + note).strip()[-4000:]
         return {"type": "abstain"}
+
+    def _enforced_hint(self, st, variables: dict) -> bool:
+        """Is this question's engine hint one the Coder must answer to? Only for the functions listed in `enforce_hints` (their
+        precision was measured: `item_qty` 16/16 on dev300; whole-shop `sales_metrics` 64/91 is never one), and for `item_qty` only
+        when the question asks in the item's BASE unit (or names none): the engine counts in base units, "bao nhiêu thùng" is not
+        its number."""
+        h = st.engine_hint
+        fn = h.call.get("function") if h is not None else None
+        if fn not in self.enforce_hints:
+            return False
+        if fn == "item_qty":
+            unit = str(getattr(st.brief, "unit", None) or "").strip()
+            if unit:
+                try:
+                    return fold(str(variables["item_base_unit"](h.call["args"]["item"]))) == fold(unit)
+                except Exception:  # noqa: BLE001 - the base unit is unknown: the hint is not provably in the asked unit
+                    return False
+        return True
 
     @staticmethod
     def _engine_confirms(st, interp) -> str:

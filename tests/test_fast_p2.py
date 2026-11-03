@@ -75,8 +75,10 @@ def test_answer_type_and_k_from_the_wording():
     assert (r.answer_type, r.k, r.sure) == ("list", 3, True)
     assert read_type("mặt hàng nào bán chạy nhất tuần rồi").answer_type == "string"
     assert read_type("doanh thu 3 tháng có tăng liên tục không?").answer_type == "boolean"
-    d = read_type("tháng 5 bán được bao nhiêu ly")
+    d = read_type("tháng 5 doanh thu là bao nhiêu")
     assert (d.answer_type, d.sure) == ("number", False)                                                 # the default never overrides
+    c = read_type("tháng 5 bán được bao nhiêu ly")
+    assert (c.answer_type, c.rule, c.sure) == ("number", "how many", True)                              # a count of objects is a number
 
 
 def test_names_come_from_the_data_and_grammar_or_time_words_are_not_names():

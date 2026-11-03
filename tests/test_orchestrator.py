@@ -238,6 +238,49 @@ def test_engine_reference_validation_and_comparison():
     assert agrees(top, ["A", "B", "C"]) and not agrees(top, ["B", "A", "C"]) and agrees(top, 12)      # a shape it cannot compare
 
 
+def test_a_call_with_a_formal_argument_is_repaired_and_a_condition_drops_it():
+    """dev300 2b4ca48e19: 120 of 242 engine calls were dropped whole for one argument the function does not take."""
+    from datamate.agents.coder import engine_first
+    from datamate.engines.reference import reference_note, resolve_reference
+    tools = {"sales_metrics": lambda start, end: {"revenue": 7_100_000, "orders": 66, "avg_order": 107_748},
+             "item_qty": lambda item, start, end: 31, "item_base_unit": lambda item: "kg",
+             "purchase_avg_price": lambda item, start, end, unit=None: 200_556}
+    day = {"start": "2026-05-11", "end": "2026-05-11"}
+    ref, why = resolve_reference({"function": "sales_metrics", "args": {**day, "metric": "order_count"}}, tools, "number")
+    assert why == "" and ref.value == 66 and ref.key == "orders"                      # q_4362: the engine says 66, the Coder said 0
+    assert ref.expr == "sales_metrics(start='2026-05-11', end='2026-05-11')['orders']" and ref.text.endswith("-> 66")
+    assert "['orders']" in reference_note(ref) and "FIRST call `sales_metrics(start='2026-05-11', end='2026-05-11')['orders']`" in engine_first("", ref)[0]
+    avg, _ = resolve_reference({"function": "sales_metrics", "args": {**day, "metric": "avg_revenue_per_order", "valid_only": True}}, tools, "number")
+    assert avg.value == 107_748
+    nep = {"function": "item_qty", "args": {"item": "Nếp cái hoa vàng", **day, "unit": "KG"}}
+    assert resolve_reference(nep, tools, "number")[0].value == 31                     # the base unit, compared folded
+    # conditions the function cannot express: the whole shop's figure would contradict the right answer
+    for bad in ({"metric": "cancelled_orders"}, {"shift": "afternoon"}, {"channel": "zalo_oa"}, {"valid_only": False}):
+        r, why = resolve_reference({"function": "sales_metrics", "args": {**day, **bad}}, tools, "number")
+        assert r is None and "does not take it" in why, bad
+    assert resolve_reference({"function": "item_qty", "args": {"item": "x", **day, "unit": "bao"}}, tools, "number")[0] is None
+    # a repaired call is a cross-check of a plain number only: a revenue is not the answer of a percent change
+    r, why = resolve_reference({"function": "sales_metrics", "args": {**day, "metric": "revenue"}}, tools, "percent")
+    assert r is None and "number answer" in why
+    assert resolve_reference({"function": "sales_metrics", "args": {**day, "metric": "revenue"}}, tools, None)[0] is None
+    # a call the function takes as it is: unchanged, for any answer type (as before); `unit` is a real argument of purchase_avg_price
+    assert resolve_reference({"function": "sales_metrics", "args": day}, tools, "percent")[0].value["orders"] == 66
+    pap = resolve_reference({"function": "purchase_avg_price", "args": {"item": "x", **day, "unit": "thùng"}}, tools, "number")[0]
+    assert pap.call["args"]["unit"] == "thùng" and pap.key is None
+
+
+def test_a_dropped_engine_call_is_logged_once_with_its_reason():
+    call = {"function": "debt_repaid", "args": {"start": "2026-05-01", "end": "2026-05-31", "shift": "sáng"}}
+    m = Scripted(code=[RIGHT], explain=[{"spec": {**SPEC, "engine_call": call}}])
+    st = _st()
+    o = _orch(m)
+    o.inputs = _Tools()
+    o.run(st)
+    dropped = [e for e in st.log["orchestrator"] if "engine_call_dropped" in e]
+    assert len(dropped) == 1 and "shift='sáng'" in dropped[0]["engine_call_dropped"] and dropped[0]["call"] == call
+    assert st.engine_ref is None and "ENGINE REFERENCE" not in m.prompts("code")[0]
+
+
 class _Tools:
     """Inputs stub: the real sandbox variables plus one engine function."""
     def variables(self, st):
@@ -436,6 +479,14 @@ def test_engine_hint_is_derived_from_the_spec_and_shown_to_the_coder():
     assert route(S(entities=item), tools, None, None) is None                                     # no period
     assert route(S(entities=item, periods=[{"role": "main"}, {"role": "compare"}]), tools, "2026-05-01", "2026-05-31") is None
     assert route(S(entities=item + item), tools, "2026-05-01", "2026-05-31") is None              # two entities: not a plain item question
+    # the item's BASE unit named as a second entity is no condition (dev300 q_1885: `cái` in `Đơn vị tính`, role item)
+    kg = {"value": "Kg", "column": "Đơn vị tính", "role": "item"}
+    assert route(S(entities=item + [kg]), tools, "2026-05-01", "2026-05-31").call["function"] == "item_qty"
+    assert route(S(entities=[kg] + item), tools, "2026-05-01", "2026-05-31").call["function"] == "item_qty"   # by value, not position
+    bao = {"value": "bao", "column": "Đơn vị tính", "role": "item"}                              # another unit: a real condition
+    assert route(S(entities=item + [bao]), tools, "2026-05-01", "2026-05-31") is None
+    no_units = {k: v for k, v in tools.items() if k != "item_base_unit"}
+    assert route(S(entities=item + [kg]), no_units, "2026-05-01", "2026-05-31") is None           # no base unit known: as before
 
 
 class _Hinted:
@@ -445,6 +496,48 @@ class _Hinted:
     def variables(self, st):
         return {"tables": {k: v.copy() for k, v in TABLES.items()}, "item_qty": lambda item, start, end: 2.0,
                 "period_start": pd.Timestamp("2026-05-01"), "period_end": pd.Timestamp("2026-05-31")}
+
+
+class _HintedKg(_Hinted):
+    def variables(self, st):
+        return {**super().variables(st), "item_base_unit": lambda item: "cái"}
+
+
+def test_an_enforced_hint_sends_a_differing_coder_back_once():
+    """dev300: the item_qty hint equalled the gold on 16 of 16 questions, the Coder overrode it on 4 (Nếp cái: 62 for 31)."""
+    five = "```python\nanswer = 5\n```"
+    m = Scripted(code=[five, RIGHT])
+    o = _orch(m)
+    o.inputs = _HintedKg()
+    st = _st()
+    assert o.run(st) == {"type": "number", "answer": 2}
+    t0 = st.log["turns"][0]
+    assert t0["issues"] == ["hint_mismatch"] and t0["verdict"]["source"] == "checks" and t0["verdict"]["target"] == "coder"
+    assert "item_qty(item='Bánh tiramisu', start='2026-05-01', end='2026-05-31') -> 2.0" in t0["verdict"]["feedback"]
+    assert st.log["routing"][0]["enforced"] is True
+    # a Coder that keeps its own value is trusted (said once)
+    m2 = Scripted(code=[five])
+    o2 = _orch(m2)
+    o2.inputs = _HintedKg()
+    assert o2.run(_st()) == {"type": "number", "answer": 5}
+    # not a listed function: logged only, as before
+    m3 = Scripted(code=[five])
+    o3 = _orch(m3, enforce_hints=())
+    o3.inputs = _HintedKg()
+    st3 = _st()
+    assert o3.run(st3) == {"type": "number", "answer": 5} and st3.log["turns"][0]["issues"] == []
+    assert "enforced" not in st3.log["routing"][0]
+
+
+def test_an_item_qty_hint_is_not_enforced_when_the_question_asks_in_another_unit():
+    five = "```python\nanswer = 5\n```"
+    for unit, said in (("thùng", False), ("Cái", True)):        # the engine counts in the base unit ("cái")
+        m = Scripted(code=[five, RIGHT], explain=[{"spec": {**SPEC, "unit": unit}}])
+        o = _orch(m)
+        o.inputs = _HintedKg()
+        st = _st()
+        o.run(st)
+        assert (st.log["turns"][0]["issues"] == ["hint_mismatch"]) is said, unit
 
 
 def test_the_hint_reaches_the_task_and_is_logged_without_deciding_the_verdict():
@@ -684,6 +777,29 @@ def test_the_judge_reads_the_verified_facts_and_may_quote_them():
     assert "VERIFIED FACTS" not in m2.prompts("judge")[0] and v2.source == "judge_ignored"   # evidence nowhere to be found
 
 
+def test_the_judge_reads_the_periods_code_computed_only_when_the_flag_is_on():
+    from datetime import date
+
+    from datamate.agents.explainer import Spec
+    from datamate.agents.question import PeriodMention
+    from datamate.context import Period, Resolved
+    st, steps = _st(), [RunResult(code="answer = n", output="2", answered=True, value=2)]
+    st.named_periods = [PeriodMention("month 3/2025", date(2025, 3, 1), date(2025, 3, 31))]
+    st.period = Resolved(date(2026, 8, 21), [Period("March 2025", date(2025, 3, 1), date(2025, 3, 31), "main")])
+    st.brief = Spec(rewritten_question="q", open_issues=["periods: the question names month 4/2025 (2025-04-01..2025-04-30) and no spec period equals it", "entities: x"])
+    it, line = Interpretation("number", 2), {"type": "number", "answer": 2}
+    judge = {"verdict": "revise", "evidence": "2025-03-01 .. 2025-03-31", "problem": "the Coder used another month"}
+    m = Scripted(judge=[judge])
+    v = Evaluator(m, judge_periods=True).evaluate(st, "C", steps, True, 2, it, line)
+    p = m.prompts("judge")[0]
+    assert "# PERIODS (computed by code" in p and "month 3/2025: 2025-03-01 .. 2025-03-31" in p and "main 'March 2025'" in p
+    assert "no spec period equals it" in p and "entities: x" not in p              # only the period issues
+    assert v.decision == "revise" and v.found_in == "facts"                         # the dates are evidence the judge may quote
+    m2 = Scripted(judge=[judge])
+    Evaluator(m2).evaluate(st, "C", steps, True, 2, it, line)
+    assert "PERIODS (computed" not in m2.prompts("judge")[0]                        # off by default
+
+
 def test_the_code_audits():
     from datamate.answer.audit import entity_absent, profit_bound, string_literals
     natri = ("mask = joined['Hoạt chất'].str.lower().str.contains('natri|clor', na=False)\n"
@@ -719,3 +835,158 @@ def test_audits_are_logged_in_shadow_and_said_once_when_on():
     st3 = _st()
     _orch(m3, audit_mode="off").run(st3)
     assert "audit" not in st3.log["turns"][0]
+
+
+# ------------------------------------------------------------------ audits of the periods (error analysis, "Review")
+def _mention(label, a, b):
+    from datetime import date
+
+    from datamate.agents.question import PeriodMention
+    return PeriodMention(label, date.fromisoformat(a), date.fromisoformat(b))
+
+
+def _periods(*rows):
+    from datetime import date
+
+    from datamate.context import Period
+    return [Period(lbl, date.fromisoformat(a), date.fromisoformat(b), role) for lbl, a, b, role in rows]
+
+
+def test_period_mismatch_wants_the_periods_handed_to_the_coder_to_equal_the_ones_the_question_names():
+    from datamate.answer.audit import period_mismatch
+    jan = [_mention("month 1/2026", "2026-01-01", "2026-01-31"), _mention("month 12/2025", "2025-12-01", "2025-12-31")]
+    q = "T1/2026 so với T12/2025 doanh thu tăng bao nhiêu %"
+    quarter = _periods(("q1", "2026-01-01", "2026-03-31", "main"), ("dec", "2025-12-01", "2025-12-31", "compare"))
+    why = period_mismatch(q, jan, quarter)
+    assert "month 1/2026 2026-01-01..2026-01-31" in why and "main 2026-01-01..2026-03-31" in why and "month 12/2025" not in why
+    exact = _periods(("jan", "2026-01-01", "2026-01-31", "main"), ("dec", "2025-12-01", "2025-12-31", "compare"))
+    assert period_mismatch(q, jan, exact) == ""
+    assert "none" in period_mismatch(q, jan, [])                                # the spec has no period at all
+    # a balance: the period handed to the Coder starts at the first day of the data and may be wider than the phrase
+    bal = [_mention("month 5/2026", "2026-05-01", "2026-05-31")]
+    assert period_mismatch("tồn kho đến hết tháng 5/2026", bal, _periods(("all", "2025-01-01", "2026-05-31", "main"))) == ""
+    # to-date against the same days of the previous month: the comparison period is cut short on purpose
+    q2 = "So với cùng kỳ tháng trước, doanh thu từ đầu tháng này đến hết hôm nay tăng hay giảm bao nhiêu %"
+    named = [_mention("last month", "2026-04-01", "2026-04-30"), _mention("month to date", "2026-05-01", "2026-05-24")]
+    got = _periods(("mtd", "2026-05-01", "2026-05-24", "main"), ("same days", "2026-04-01", "2026-04-24", "compare"))
+    assert period_mismatch(q2, named, got) == ""
+
+
+def test_date_literal_finds_dates_the_coder_typed_outside_every_period():
+    from datamate.answer.audit import code_dates, date_literal
+    ps = _periods(("may", "2026-05-01", "2026-05-31", "main"))
+    named = [_mention("month 5/2026", "2026-05-01", "2026-05-31")]
+    q, as_of = "tháng 5 bán được bao nhiêu cái", "2026-07-22"
+    typed = "d = tables['don']\nm = d[(d['Ngày'] >= pd.Timestamp('2025-05-01')) & (d['Ngày'] <= pd.Timestamp('2025-05-31 23:59:59'))]\nanswer = len(m)"
+    assert "2025-05-01" in date_literal(q, named, ps, typed, as_of)
+    assert "2025-03-01" in date_literal(q, named, ps, "m = d[d['Ngày'] >= pd.Timestamp(2025, 3, 1)]", as_of)       # a call with ints
+    assert date_literal(q, named, ps, "m = d[(d['Ngày'] >= period_start) & (d['Ngày'] <= period_end)]\nanswer = len(m)", as_of) == ""
+    assert date_literal(q, named, ps, "m = d[d['Ngày'] < pd.Timestamp('2026-06-01')]", as_of) == ""                   # end + 1 day
+    assert date_literal(q, named, ps, "print(f'dates 2025-05-01'); print('2025-05-01')", as_of) == ""                 # only echoes
+    assert date_literal(q, named, ps, "d = d[d['Ngày'] >= '1900-01-01']", as_of) == ""                                # a sentinel
+    assert date_literal("tồn kho đến hết tháng 5", named, ps, typed, as_of) == ""                                    # a balance: wide bounds
+    assert date_literal("tháng 5 sau ngày 01/05/2025 bán bao nhiêu", named, ps, typed, as_of) != ""                  # one date of the question, not both
+    assert date_literal("so với ngày 31/05/2025 và 01/05/2025 tháng 5 bán bao nhiêu", named, ps, typed, as_of) == ""  # the question writes them
+    assert date_literal(q, [], [], typed, as_of) == ""                                                               # nothing to compare with
+    assert code_dates("x = (") == set() and len(code_dates("a = '2025-05-01'; b = '01/06/2025'; c = '2025-05-01 08:00'")) == 2
+
+
+def test_a_period_mismatch_goes_back_to_the_explainer_once_when_the_audit_is_on():
+    def run(**kw):
+        m = Scripted(code=[RIGHT])
+        st = _st()
+        st.named_periods = [_mention("month 4/2026", "2026-04-01", "2026-04-30")]       # the spec says May: nobody covers April
+        return m, st, _orch(m, **kw).run(st)
+    m0, st0, got0 = run()                                                                # shadow: logged, decides nothing
+    assert got0 == {"type": "number", "answer": 2} and "month 4/2026" in st0.log["turns"][0]["audit"]["period_mismatch"]
+    assert st0.log["turns"][0]["verdict"]["source"] == "judge"
+    m1, st1, got1 = run(audit_mode="on")
+    assert got1 == {"type": "number", "answer": 2}
+    assert [t["verdict"]["source"] for t in st1.log["turns"]] == ["checks", "judge"]     # sent back once, then trusted
+    first = st1.log["turns"][0]["verdict"]
+    assert first["target"] == "explainer" and "month 4/2026" in first["feedback"] and "2026-05-01..2026-05-31" in first["feedback"]
+    assert len(m1.prompts("explain")) > len(m0.prompts("explain"))                       # the Explainer ran again
+    m2, st2, _ = run(audit_mode="on", explainer_reruns=0)                                # no re-run left: the Coder cannot fix it, so not said
+    assert [t["verdict"]["source"] for t in st2.log["turns"]] == ["judge"]
+    m3, st3, _ = run(audit_mode="on", audit_skip=("period_mismatch",))
+    assert [t["verdict"]["source"] for t in st3.log["turns"]] == ["judge"] and "period_mismatch" in st3.log["turns"][0]["audit"]
+
+
+def test_date_literal_is_logged_but_enforced_only_when_it_is_not_skipped():
+    typed = ("```python\nd = tables['don']\nn = int(((d['Tên hàng'] == 'Bánh tiramisu') & (d['Ngày'] >= '2025-05-01')).sum())\n"
+             "answer = n\n```")
+    m = Scripted(code=[typed])
+    st = _st()
+    _orch(m, audit_mode="on").run(st)                                                    # default skip: date_literal is log-only
+    assert "2025-05-01" in st.log["turns"][0]["audit"]["date_literal"] and st.log["turns"][0]["verdict"]["source"] == "judge"
+    m2 = Scripted(code=[typed, RIGHT])
+    st2 = _st()
+    assert _orch(m2, audit_mode="on", audit_skip=()).run(st2) == {"type": "number", "answer": 2}
+    assert [t["verdict"]["source"] for t in st2.log["turns"]] == ["checks", "judge"]
+    assert st2.log["turns"][0]["verdict"]["target"] == "coder" and "period_start" in st2.log["turns"][0]["verdict"]["feedback"]
+
+
+def test_the_judge_gets_room_for_its_whole_reply(monkeypatch):
+    """dev300: max_tokens=800 cut 8 of 287 judge replies before the closing brace, read as unreadable (= accept)."""
+    from datamate.config import Settings
+    seen = {}
+
+    def fake_chat(model, system, user, stage="", max_tokens=None, context=None, **kw):
+        seen[stage] = max_tokens
+        return '{"verdict": "accept"}'
+    monkeypatch.setattr("datamate.answer.evaluator.chat", fake_chat)
+    st, steps = _st(), [RunResult(code="answer = n", output="2", answered=True, value=2)]
+    it, line = Interpretation("number", 2), {"type": "number", "answer": 2}
+    assert Evaluator(Scripted()).evaluate(st, "C", steps, True, 2, it, line).decision == "accept" and seen["judge"] == 1500
+    Evaluator(Scripted(), max_tokens=900).evaluate(st, "C", steps, True, 2, it, line)
+    assert seen["judge"] == 900 and Settings().judge_max_tokens == 1500
+
+
+def test_a_judge_reply_cut_by_the_cap_is_read_up_to_the_cut(monkeypatch):
+    """B4: v2 writes evidence before problem / fix and reads the complete fields of a cut reply; the verbatim filter still decides."""
+    from datamate.answer.evaluator import JUDGE_SYSTEM, JUDGE_SYSTEM_V1
+    sent = {}
+
+    def judge_says(text):
+        def fake_chat(model, system, user, stage="", max_tokens=None, context=None, **kw):
+            sent["system"] = system
+            return text
+        monkeypatch.setattr("datamate.answer.evaluator.chat", fake_chat)
+    st, steps = _st(), [RunResult(code="answer = n", output="2", answered=True, value=2)]
+    st.facts = "# VERIFIED FACTS\n- tháng 5: 1 valid orders.\n"
+    it, line = Interpretation("number", 2), {"type": "number", "answer": 2}
+    judge_says('{"verdict": "revise", "target": "coder", "evidence": "1 valid orders", "problem": "2 is more than the valid ord')
+    v = Evaluator(Scripted()).evaluate(st, "C", steps, True, 2, it, line)
+    assert sent["system"] == JUDGE_SYSTEM and v.decision == "revise" and v.found_in == "facts" and "reply cut" in v.feedback
+    judge_says('{"verdict": "revise", "target": "coder", "evidence": "1 valid ord')               # the quote itself was cut
+    assert Evaluator(Scripted()).evaluate(st, "C", steps, True, 2, it, line).source == "judge_ignored"
+    judge_says('{"verdict": "revise", "target": "coder", "evidence": "1 valid orders"} {"verdict": "accept"}')    # broken, not cut
+    assert Evaluator(Scripted()).evaluate(st, "C", steps, True, 2, it, line).source == "judge_ignored"
+    judge_says('{"verdict": "revise", "target": "coder", "evidence": "1 valid orders", "problem": "2 is more')
+    v1 = Evaluator(Scripted(), judge_format="v1").evaluate(st, "C", steps, True, 2, it, line)      # as before: unreadable = accept
+    assert sent["system"] == JUDGE_SYSTEM_V1 and v1.source == "judge_ignored" and "unreadable" in v1.feedback
+    fmt = lambda sysp: sysp[sysp.index("Return only JSON"):]                                        # noqa: E731
+    assert fmt(JUDGE_SYSTEM).index('"evidence"') < fmt(JUDGE_SYSTEM).index('"problem"')
+    assert fmt(JUDGE_SYSTEM_V1).index('"problem"') < fmt(JUDGE_SYSTEM_V1).index('"evidence"')
+
+
+def test_a_revise_whose_evidence_pieces_are_in_the_facts_stands():
+    """B1: "VERIFIED FACTS: ... 19... ENGINE VALUE: ... -> 32" is in no text as a whole (dev300 q_c4eee7e4ca8d: a right diagnosis, dropped)."""
+    st, steps = _st(), [RunResult(code="answer = n", output="140", answered=True, value=140)]
+    st.facts = "# VERIFIED FACTS\n- valid sales lines of item 'Nếp cái hoa vàng' in the main period: 19\n"
+    it, line = Interpretation("number", 140), {"type": "number", "answer": 140}
+    ev = "VERIFIED FACTS: valid sales lines of item 'Nếp cái hoa vàng' in the main period: 19... the code returned 140"
+    judge = {"verdict": "revise", "target": "coder", "evidence": ev, "problem": "140 kg from 19 lines"}
+    v = Evaluator(Scripted(judge=[judge])).evaluate(st, "C", steps, True, 140, it, line)
+    assert v.decision == "revise" and v.found_in == "facts_fragments"
+    strict = Evaluator(Scripted(judge=[judge]), evidence="strict").evaluate(st, "C", steps, True, 140, it, line)
+    assert strict.source == "judge_ignored"                                               # as before
+    # pieces found only in the question or the code do not count (format complaints about right answers got through that way)
+    q_only = {**judge, "evidence": "ORIGINAL QUESTION: tiramisu thang 5... bn cai"}
+    assert Evaluator(Scripted(judge=[q_only])).evaluate(st, "C", steps, True, 140, it, line).source == "judge_ignored"
+    # boilerplate of the facts is no evidence: the header, or a phrase every fact line has, without a number of the facts
+    st.facts = "# VERIFIED FACTS (counted by the system from the data; counts, not the answer)\n" + st.facts.split("\n", 1)[1]
+    for ev in ("VERIFIED FACTS (counted by the system from the data; counts, not the answer)... the answer is not a date",
+               "the main period... the format is wrong"):
+        v = Evaluator(Scripted(judge=[{**judge, "evidence": ev}])).evaluate(st, "C", steps, True, 140, it, line)
+        assert v.source == "judge_ignored", ev

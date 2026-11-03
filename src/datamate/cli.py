@@ -8,14 +8,15 @@ import json
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
 from tqdm import tqdm
 
 from datamate.config import Settings
-from datamate.eval.runs import code_fingerprint, new_run_dir, summarize, write_run
+from datamate import lexicon
+from datamate.eval.runs import SubmissionWriter, code_fingerprint, new_run_dir, summarize, write_run
 from datamate.eval.scorer import score
 from datamate.pipeline import Pipeline, Split
 from datamate.sandbox.memory import apply_limit
@@ -23,7 +24,8 @@ from datamate.sandbox.memory import apply_limit
 # smolagents wraps a failed request inside the coder as "AgentGenerationError: Error in generating model output:
 # Connection error." (seen: 18 dev300 abstains after an SSH tunnel drop that resume did not redo)
 INFRA_ERRORS = ("APIStatusError", "APIConnectionError", "APITimeoutError", "Error code: 402", "Error code: 429", "Error code: 5",
-                "ConnectError", "ReadTimeout", "RemoteProtocolError", "Connection error", "Request timed out")
+                "ConnectError", "ReadTimeout", "RemoteProtocolError", "Connection error", "Request timed out",
+                "the run's time budget is used up")      # never started (pipeline.py): a resumed run answers it
 
 
 def _infra_failure(log: dict) -> bool:
@@ -64,6 +66,7 @@ def _run(args) -> None:
     print(f"run folder: {run_dir}")
     t_start = time.time()
     pipe = Pipeline(split, settings)
+    pipe.set_run_budget(settings.run_deadline_s)      # the run's clock starts here, shop loading included
 
     # warm the per-business cache serially (file parsing is not worth racing)
     for b in sorted({q["business_id"] for q in questions}):
@@ -79,13 +82,20 @@ def _run(args) -> None:
         path.write_text(json.dumps(log, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
         return line
 
+    # submission.jsonl is rewritten after EVERY finished question (eval/runs.py): a run that is killed or cut by the time limit
+    # (README Rule 8) still has all its finished answers on disk
+    writer = SubmissionWriter(out, [q["id"] for q in questions], keep_existing=bool(args.resume_run))
     with ThreadPoolExecutor(settings.workers) as ex:
-        lines = list(tqdm(ex.map(work, questions), total=len(questions), desc=f"{settings.backend}:{settings.model_id}"))
-
-    with open(out, "w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(json.dumps(line, ensure_ascii=False) + "\n")
-    print(f"wrote {len(lines)} answers -> {out}")
+        futures = {ex.submit(work, q): q for q in questions}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc=f"{settings.backend}:{settings.model_id}"):
+            q = futures[fut]
+            try:
+                line = fut.result()
+            except Exception as e:  # noqa: BLE001 - work() should not raise (Pipeline.answer turns failures into abstain); one bad question must not lose the file
+                print(f"{q['id']}: {type(e).__name__}: {e}", file=sys.stderr)
+                line = {"id": q["id"], "type": "abstain"}
+            writer.add(line)
+    print(f"wrote {len(writer)} answers -> {out}")
 
     gold = split.root / "answers.jsonl"
     meta = {
@@ -101,12 +111,16 @@ def _run(args) -> None:
                      "providers": settings.openrouter_providers,
                      "structure_cards": os.getenv("DATAMATE_STRUCTURE_CARDS", "1"),
                      "purchase_engine": os.getenv("DATAMATE_PURCHASE_ENGINE", "1"),
+                     "lexicon": lexicon.ENABLED, "glossary": lexicon.GLOSSARY,   # the values in effect
                      "p2_mode": settings.p2_mode, "plan_mode": settings.plan_mode, "spec_max_tokens": settings.spec_max_tokens,
                      "shared_prefix": settings.shared_prefix, "guideline_rows": settings.guideline_rows,
                      "verified_facts": settings.verified_facts, "decide_mode": settings.decide_mode,
                      "skip_judge_on_engine": settings.skip_judge_on_engine, "trust_repeat": settings.trust_repeat,
                      "judge_unanswerable": settings.judge_unanswerable, "judge_facts": settings.judge_facts,
-                     "audit_mode": settings.audit_mode},
+                     "judge_periods": settings.judge_periods, "judge_max_tokens": settings.judge_max_tokens, "judge_format": settings.judge_format, "judge_evidence": settings.judge_evidence,
+                     "audit_mode": settings.audit_mode, "audit_skip": list(settings.audit_skip), "enforce_hints": list(settings.enforce_hints), "question_deadline_s": settings.question_deadline_s,
+                     "run_deadline_s": settings.run_deadline_s, "run_quick_s": settings.run_quick_s,
+                     "deadline_fallback": settings.deadline_fallback},
         "filters": {"limit": args.limit, "business": args.business},
         **summarize(log_dir, out, gold if gold.exists() else None),
     }

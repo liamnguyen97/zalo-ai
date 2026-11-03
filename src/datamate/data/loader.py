@@ -18,7 +18,7 @@ from pathlib import Path
 import pandas as pd
 
 from datamate.data.readme import roles_for_tables
-from datamate.data.status import add_status_std, find_order_col
+from datamate.data.status import add_status_std, find_order_col, payment_labels
 
 DATE_HINT = re.compile(r"ng[àa]y|date|h[ạa]n|th[ờo]i ?gian|time", re.I)
 NUMDAYS_HINT = re.compile(r"s[ốo] ng[àa]y|ng[àa]y n[ợo]|ng[àa]y c[ôo]ng|tu[ổo]i n[ợo]", re.I)  # day *counts*, not dates
@@ -301,9 +301,13 @@ def drop_consecutive_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     Only a row identical to the row right before it is dropped. Measured on the training businesses: where
     deduplication fixed the totals, every duplicate was adjacent; where it hurt, none was (those are genuine
     repeated lines of an order), so a blanket drop_duplicates() would be wrong.
+
+    Order-level tables (one row per order, the order id ~unique) are cleaned the same way: a row identical to the one before in EVERY
+    cell, order id included, is the export error counted once (dev_009 `danh_sach_hoa_don`: 308 such rows, May-2025 revenue 504.395.000
+    with them and 500.782.000 without; none of the 30 training businesses has one, so nothing changes there).
     """
     oc = find_order_col(df)
-    if oc is None or len(df) < 2 or df[oc].nunique() >= 0.9 * len(df):  # only line-level tables
+    if oc is None or len(df) < 2:
         return df, 0
     cols = [c for c in df.columns if c not in ("source_sheet", "status_std", "valid_order")]
     same = (df[cols].eq(df[cols].shift()) | (df[cols].isna() & df[cols].shift().isna())).all(axis=1) & df[oc].notna()
@@ -343,11 +347,12 @@ def load_business(biz_dir: str | Path) -> Business:
     biz.tables = {}
     merged = _merge_split_tables(frames)
     declared = roles_for_tables(biz.readme, {k: list(v.columns) for k, v in merged.items()})
+    paid = payment_labels(merged, declared)       # "khách trả <a payment method of this shop>" in a note is a payment, not a return
     for k, v in merged.items():
         v, n_dup = drop_consecutive_duplicates(_fill_groups(v))
         if n_dup:
             dropped[f"{k}:dup"] = n_dup
-        biz.tables[k] = add_status_std(v, prefer=declared.get(k, {}).get("order_status"))
+        biz.tables[k] = add_status_std(v, prefer=declared.get(k, {}).get("order_status"), payment=paid)
     biz.notes = [
         (f"`{k[:-4]}`: removed {n} adjacent duplicate rows (an export error; counted once by the rulebook)" if k.endswith(":dup")
          else f"`{k}`: removed {n} summary rows (Tổng ngày/Cộng ngày/Tổng tháng...) because they are not orders")
