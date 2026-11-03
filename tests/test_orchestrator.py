@@ -471,10 +471,11 @@ def test_engine_hint_is_derived_from_the_spec_and_shown_to_the_coder():
     assert h.agrees_with(31) and not h.agrees_with(186)
     assert route(S(answer_type="list", k=2), tools, "2026-05-01", "2026-05-31").call["function"] == "top_items"
     assert route(S(answer_type="string", measure="money", k=1, rewritten_question="Which customer spent the most"), tools,
-                 "2026-05-01", "2026-05-31").call["function"] == "top_customers"
+                 "2026-05-01", "2026-05-31", "Tháng 5 khách nào mua nhiều tiền nhất?").call["function"] == "top_customers"
     assert route(S(measure="orders"), tools, "2026-05-01", "2026-05-31") is None            # whole-shop shapes were worse than the Coder
     assert route(S(entities=item, measure="money"), tools, "2026-05-01", "2026-05-31") is None
-    assert route(S(entities=item, rewritten_question="What is the ending inventory quantity of X?"), tools, "2026-05-01", "2026-05-31") is None
+    assert route(S(entities=item, rewritten_question="What is the ending inventory quantity of X?"), tools, "2026-05-01", "2026-05-31",
+                 "Tồn kho Nếp cái hoa vàng cuối ngày hôm nay là bao nhiêu kg?") is None
     assert route(S(entities=item, rewritten_question="Tháng 5 bán bao nhiêu"), tools, "2026-05-01", "2026-05-31", "tháng 5 bán bao nhiêu") is None
     assert route(S(entities=item), tools, None, None) is None                                     # no period
     assert route(S(entities=item, periods=[{"role": "main"}, {"role": "compare"}]), tools, "2026-05-01", "2026-05-31") is None
@@ -487,6 +488,42 @@ def test_engine_hint_is_derived_from_the_spec_and_shown_to_the_coder():
     assert route(S(entities=item + [bao]), tools, "2026-05-01", "2026-05-31") is None
     no_units = {k: v for k, v in tools.items() if k != "item_base_unit"}
     assert route(S(entities=item + [kg]), no_units, "2026-05-01", "2026-05-31") is None           # no base unit known: as before
+
+
+def test_engine_hints_read_the_structured_spec_and_the_original_question_not_the_rewrite():
+    """dev300 q_4333ad0589a1: the English rewrite said "customers", so a debt question got the REVENUE ranking `top_customers`."""
+    from datamate.engines.routing import route
+    tools = {"item_qty": lambda item, start, end: 31.0, "top_customers": lambda k=None, start=None, end=None: [("An", 100)]}
+    def S(**kw):
+        base = dict(answer_type="table", measure="money", k=3, entities=[], rewritten_question="x", engine_call=None, rule_sections=[],
+                    periods=[{"role": "main", "start": "2025-01-01", "end": "2026-05-20"}])
+        return SimpleNamespace(**{**base, **kw})
+    debt_q = "cho bảng 3 khách còn nợ nhìu nhất tính đến hết ngày 20/05/2026, kèm số tiền còn nợ"
+    rewrite = "List the top 3 customers with the highest outstanding debt as of 2026-05-20"
+    a, b = "2025-01-01", "2026-05-20"
+    # each of the three gates is enough: the question's words, the spec's engine_call, the rulebook sections it cites
+    assert route(S(rewritten_question=rewrite), tools, a, b, debt_q) is None
+    debt_call = {"function": "debt_by_customer", "args": {"day": b, "k": 3}}
+    assert route(S(rewritten_question=rewrite, engine_call=debt_call), tools, a, b, "3 khách mua nhiều tiền nhất") is None
+    assert route(S(rule_sections=["4. Công nợ"]), tools, a, b, "3 khách mua nhiều tiền nhất") is None
+    # a sales section cited too keeps the hint: the model cites §5 "Nhập trừ bán (quy về cùng đơn vị)" for a unit conversion
+    sales = route(S(rule_sections=["1. Đơn hàng và doanh thu", "5. Kho, nhập hàng, giá vốn"]), tools, a, b, "3 khách mua nhiều tiền nhất")
+    assert sales.call["function"] == "top_customers"
+    # the rewrite's language no longer matters: a Vietnamese rewrite gets the same hint
+    assert route(S(rewritten_question="3 khách hàng có doanh thu cao nhất"), tools, a, b, "3 khách hàng có tổng tiền mua cao nhất là ai?").call
+    assert route(S(), tools, a, b, "3 nhóm khách nào mua nhiều tiền nhất") is None                 # a customer group is not a customer
+    assert route(S(), tools, a, b, "3 nhân viên nào bán nhiều tiền nhất") is None
+    assert route(S(), tools, a, b, None) is None                                                     # no question: no customer reading
+    item = [{"value": "Nếp cái hoa vàng", "role": "item"}]
+    qty = dict(answer_type="number", measure="quantity", k=None, entities=item)
+    assert route(S(**qty), tools, a, b, "Tháng 5 bán được bao nhiêu kg Nếp cái hoa vàng?").call["function"] == "item_qty"
+    assert route(S(**qty), tools, a, b, "Số nhập trừ số bán của Nếp cái hoa vàng tháng 5 là bao nhiêu kg?") is None
+    assert route(S(**qty), tools, a, b, "Trung bình mỗi ngày bán bao nhiêu kg Nếp cái hoa vàng?") is None
+    assert route(S(**qty), tools, a, b, "Tháng 5 bán Nếp cái hoa vàng được bao nhiêu tiền?") is None   # money, though the spec says quantity
+    tole = [{"value": "Tôn lạnh màu xanh", "role": "item"}]                                         # "tôn" in a name is not "tồn"
+    assert route(S(**{**qty, "entities": tole}), tools, a, b, "Tháng 5 bán được bao nhiêu tấm Tôn lạnh màu xanh?").call
+    same = {"function": "item_qty", "args": {"item": "Nếp cái hoa vàng", "start": a, "end": b, "unit": "bao"}}   # dropped, same function
+    assert route(S(**qty, engine_call=same), tools, a, b, "Tháng 5 bán được bao nhiêu kg Nếp cái hoa vàng?").call["function"] == "item_qty"
 
 
 class _Hinted:

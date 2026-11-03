@@ -270,6 +270,56 @@ def test_the_lexicon_writes_each_spelling_in_its_standard_form():
     assert norm("máy đt") == "may dt" and norm("Telfast HD 180mg") == "telfast hd 180mg" and norm("SP0003") == "sp0003"
 
 
+def test_the_lexicon_is_read_before_the_telex_rule():
+    """The telex rule takes the final "r" of "order" for a tone letter: read after it, the lexicon never saw "order" (dev300 q_f19c4e273491)."""
+    from datamate.text import norm
+    assert norm("quý 4/2025 cuwar hàng có bn order ddos") == "quy 4/2025 cua hang co bao nhieu don hang do"
+    assert norm("bao nhieu oder") == "bao nhieu don hang"
+    assert read_type("quý 4/2025 cuwar hàng có bn order ddos").rule == "how many"
+    assert norm("Doanh thu bữa ni") == "doanh thu hom nay"           # "ni" -> "nay", then "bua nay" -> "hom nay"
+
+
+def test_the_question_written_out_spells_shorthand_and_telex_in_full():
+    from datamate.agents.question import written_out
+    assert written_out("quý 4/2025 cuwar hàng có bn order ddos") == "quý 4/2025 cửa hàng có bao nhiêu đơn hàng đó"
+    assert written_out("tuần rồi cửa hàng bán đc bnhiu tieenf") == "tuần rồi cửa hàng bán được bao nhiêu tiền"
+    assert written_out("Dthu thangs 6 nguowif mua nhìu nhaats") == "Doanh thu tháng 6 người mua nhiều nhất"
+    assert written_out("bán được bao nhiêu ly") == "bán được bao nhiêu ly"          # already the standard: no "bao bao nhiêu"
+    assert written_out("sửa xe mô tô hết bao nhiêu") == "sửa xe mô tô hết bao nhiêu"  # protected phrase
+    assert written_out("shop mik kó mí ngừi") == "shop mình kó mí người"              # "kó" is "có": its tone is not that of "không"
+    assert written_out("2/2026 hàng mô lãi gộp nhiều nhất rứa?") == "2/2026 hàng nào lãi gộp nhiều nhất vậy?"   # accented variants as written
+
+
+def test_the_question_written_out_leaves_the_shops_words_and_names_alone():
+    import pandas as pd
+    from datamate.agents.question import written_out
+    t = {"hang": pd.DataFrame({"Tên hàng": ["Bia Tiger lon", "Gas Petrolimex 12kg", "Sơn Dulux 5L", "Áo nỉ xám"]})}
+    # the shop's words are compared folded (fold_text), not through norm, whose telex rule makes "tiger" "tige" and "gas" "ga"
+    assert written_out("thangs 6 bia tiger ban dc bnhiu lon", t) == "tháng 6 bia tiger ban được bao nhiêu lon"
+    assert written_out("gas ban bao nhieu binh", t) == "gas ban bao nhieu binh" and written_out("son dulux tieenf", t) == "son dulux tiền"
+    assert written_out("áo nỉ bán đc mấy cái", t) == "áo nỉ bán được mấy cái"          # "nỉ" folds to "ni" (= "này"), but is the shop's
+    assert written_out("xe Air Blade thay nhowts") == "xe Air Blade thay nhớt"        # capitalised inside the sentence: a name
+    assert written_out("for clear check") == "for clear check"                        # "fỏ", "clẻa" are no Vietnamese syllables
+
+
+def test_every_lexicon_standard_has_an_accented_form_to_write_out():
+    """A new lexicon entry whose standard is written without accents needs a line in question.ACCENTED_STANDARD, or it is silently
+    left out of the written-out question."""
+    from datamate.agents.question import ACCENTED_STANDARD, _accented
+    from datamate.lexicon import ENTRIES
+    missing = [(v, std) for v, std, _ in ENTRIES if not _accented(std) and std not in ACCENTED_STANDARD]
+    assert not missing, missing
+
+
+def test_the_written_out_question_goes_to_the_spec_prompt_next_to_the_original():
+    f = read_question("quý 4/2025 cuwar hàng có bn order ddos", "2026-06-24", {}, write_out=True)
+    assert f.written == "quý 4/2025 cửa hàng có bao nhiêu đơn hàng đó" and f.as_log()["written_out"] == f.written
+    assert "QUESTION WITH ITS SHORTHAND WRITTEN OUT" in f.prompt() and f.written in f.prompt()
+    plain = read_question("Doanh thu tháng 5 là bao nhiêu?", "2026-06-24", {}, write_out=True)   # nothing to write out: no line
+    assert plain.written == "" and "WRITTEN OUT" not in plain.prompt() and "written_out" not in plain.as_log()
+    assert read_question("bn order", "2026-06-24", {}).written == ""                              # off unless asked
+
+
 def test_the_lexicon_can_be_switched_off(monkeypatch):
     from datamate import lexicon
     from datamate.text import norm

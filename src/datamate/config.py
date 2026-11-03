@@ -84,6 +84,12 @@ class Settings:
     # plan call, "none" = no plan (the Coder plans in its first block).
     plan_mode: str = field(default_factory=lambda: os.getenv("DATAMATE_PLAN_MODE", "spec"))
     spec_max_tokens: int = field(default_factory=lambda: int(os.getenv("DATAMATE_SPEC_MAX_TOKENS", "3000")))
+    # The spec call also reads the question with its shorthand written out by code (agents/question.written_out: lexicon words in
+    # full with accents, telex typing decoded), next to the original question, which stays the authority. And every condition the
+    # spec filters by quotes the question's own words (Spec.conditions): a condition whose quote is not in the question goes back to
+    # the fix call (the spec added "prescription" to "doanh thu thuốc hoạt chất Vitamin C", dev300 q_83273acf61f7). 0 = off (A/B).
+    written_out: bool = field(default_factory=lambda: _flag("DATAMATE_WRITTEN_OUT", True))
+    spec_conditions: bool = field(default_factory=lambda: _flag("DATAMATE_SPEC_CONDITIONS", True))
     # Every call opens with the same shop context (rulebook, README, schema, functions): the prefix cache serves it across
     # steps (agents/shared.py). OFF by default: with it the Coder needed 7 and 12 calls on dev300 q_b445c50f6b5e (one abstain)
     # against 1 and 2 without (ledger #9); to be retried with the Coder's key instructions repeated after the question.

@@ -113,6 +113,7 @@ def _run(args) -> None:
                      "purchase_engine": os.getenv("DATAMATE_PURCHASE_ENGINE", "1"),
                      "lexicon": lexicon.ENABLED, "glossary": lexicon.GLOSSARY,   # the values in effect
                      "p2_mode": settings.p2_mode, "plan_mode": settings.plan_mode, "spec_max_tokens": settings.spec_max_tokens,
+                     "written_out": settings.written_out, "spec_conditions": settings.spec_conditions,
                      "shared_prefix": settings.shared_prefix, "guideline_rows": settings.guideline_rows,
                      "verified_facts": settings.verified_facts, "decide_mode": settings.decide_mode,
                      "skip_judge_on_engine": settings.skip_judge_on_engine, "trust_repeat": settings.trust_repeat,

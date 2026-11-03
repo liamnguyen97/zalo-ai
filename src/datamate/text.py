@@ -47,9 +47,49 @@ def _telex(tok: str) -> str:
     return t
 
 
+TONES = {"s": "́", "f": "̀", "r": "̉", "x": "̃", "j": "̣"}     # sắc huyền hỏi ngã nặng
+MODIFIED = set("ăâêôơư")
+VOWELS = set("aăâeêioôơuưy")
+
+
+def telex_decode(tok: str) -> str:
+    """Telex typing to Vietnamese letters: "cuwar" -> "cửa", "tieenf" -> "tiền", "ddos" -> "đó", "nhoms" -> "nhóm". The input method's
+    rules (dd aa ee oo aw ow uw, a final tone letter s f r x j), not a word list, so it holds for any word. `_telex` decides whether a
+    word holds a slip at all; this only writes it out (agents/question.written_out)."""
+    t = tok.lower()
+    tone = None
+    if len(t) >= 3 and t[-1] in TONES and re.search(r"[aeiouy]", t[:-1]):
+        tone, t = TONES[t[-1]], t[:-1]
+    t = t.replace("dd", "đ")
+    for a, b in (("uow", "ươ"), ("aa", "â"), ("ee", "ê"), ("oo", "ô"), ("aw", "ă"), ("ow", "ơ"), ("uw", "ư")):
+        t = t.replace(a, b)
+    if tone:
+        start = 2 if t.startswith(("qu", "gi")) and len(t) > 2 and t[2] in VOWELS else 0
+        idx = [i for i in range(start, len(t)) if t[i] in VOWELS]
+        if idx:
+            run = [idx[-1]]                                   # the last run of vowels carries the tone
+            while len(run) < len(idx) and idx[-len(run) - 1] == run[0] - 1:
+                run.insert(0, idx[-len(run) - 1])
+            mod = [i for i in run if t[i] in MODIFIED]
+            if mod:
+                pos = mod[-1]                                 # a vowel with a hat or a horn: "tiền", "người"
+            elif run[-1] < len(t) - 1 or len(run) == 1:
+                pos = run[-1]                                 # a final consonant follows: the last vowel ("khách", "tháng")
+            else:
+                pos = run[-2] if len(run) == 2 else run[1]    # open syllable: "nào", "hai"; three vowels: the middle one
+            t = t[: pos + 1] + tone + t[pos + 1:]
+    out = unicodedata.normalize("NFC", t)
+    return out[0].upper() + out[1:] if tok[:1].isupper() else out
+
+
 def norm(text: str) -> str:
     """Folded (no accents, lower case, punctuation as spaces), telex slips undone, the shop owners' spellings in their standard form
-    (datamate/lexicon.py: "đh" -> "don hang", "bnhiu" -> "bao nhieu"; accented variants are read before folding)."""
+    (datamate/lexicon.py: "đh" -> "don hang", "bnhiu" -> "bao nhieu"; accented variants are read before folding).
+
+    The lexicon is read BEFORE the telex rule and once more after it (for a word the rule repaired): the rule takes a final s/f/r/x/j
+    for a tone letter, so "order" became "orde" and "oder" "ode", and those lexicon entries never matched (dev300 q_f19c4e273491
+    "cuwar hàng có bn order ddos": the type reading fell back to the default instead of "how many")."""
     from datamate import lexicon      # imported here: lexicon imports text for its glossary
     low = lexicon.apply_accented(unicodedata.normalize("NFC", (text or "").lower()))
-    return lexicon.apply_folded(" ".join(_telex(w) for w in fold_text(low).split()))
+    words = lexicon.apply_folded(fold_text(low)).split()
+    return lexicon.apply_folded(" ".join(_telex(w) for w in words))

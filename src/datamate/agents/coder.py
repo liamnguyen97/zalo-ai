@@ -167,6 +167,12 @@ def coder_brief(s, rules: bool = True) -> str:
     parts = ["# TASK", f"Compute: {s.rewritten_question}"]
     parts += ["", "# RESOLVED INPUTS (checked against the data)", "Periods:", *(_period_lines(s, None) or ["- (the question names no period)"]),
               "Values to filter by (exact spelling in the data):", *(ents or ["- (none)"])]
+    conds = [c for c in getattr(s, "conditions", None) or [] if isinstance(c, dict) and c.get("quote")]
+    if conds:
+        # quoted from the question and checked in code (explainer.check_conditions): the filters the question itself states
+        # not "the only filters": a condition the spec forgot to list is still the question's; the list only names what it states
+        parts += ["Conditions the question states (each quoted from it; do not filter by a condition that is neither listed here nor "
+                  "stated in the ORIGINAL QUESTION):", *[f"- \"{c['quote']}\": {c.get('meaning') or ''}" for c in conds]]
     if tabs:
         parts += ["Tables / columns the explainer suggests (a hint; engine functions / `sales_orders` / `item_lines` still come first):", *tabs]
     if s.rules and rules:

@@ -55,8 +55,13 @@ class Spec:
     unit: str | None = None                               # the unit the answer is asked in ("một thùng" -> "thùng"), fast mode
     rule_refs: list[str] = field(default_factory=list)    # rulebook row labels; code copies the lines into `rules` (fast mode)
     method: str = ""                                      # the plan, written in the spec call (DATAMATE_PLAN_MODE=spec)
+    conditions: list[dict] = field(default_factory=list)  # [{"quote", "meaning"}]: what the question filters by, quoted (fast mode)
     status: str = "clear"                                 # clear | unchecked | fallback (for analysis)
     open_issues: list[str] = field(default_factory=list)  # what the checks still reported when the budget ended
+    rule_sections: list[str] = field(default_factory=list)   # set by code: the rulebook sections of rule_refs (engines/routing.py)
+
+
+CODE_FIELDS = ("status", "open_issues", "rule_sections")   # set by the harness, never taken from the model's JSON
 
 
 LANG_RULE = """\
@@ -363,7 +368,7 @@ def repair_spec(d, tables: dict, as_of: str, tools: DataTools | None = None,
     data's value when exactly one value matches clearly (notes say so). Errors go back to the model as feedback."""
     if not isinstance(d, dict):
         return None, ["spec must be a JSON object"], [], []
-    s = Spec(**{k: d[k] for k in Spec.__dataclass_fields__ if k in d and k not in ("status", "open_issues")})
+    s = Spec(**{k: d[k] for k in Spec.__dataclass_fields__ if k in d and k not in CODE_FIELDS})
     errs, warns, notes = [], [], []
     if not str(s.rewritten_question or "").strip():
         errs.append("rewritten_question is empty")
@@ -576,7 +581,68 @@ METHOD_FIELD = """
       answer form. Revenue / order counts come from `sales_metrics` or `sales_orders.revenue`, NEVER from an order total column; a
       document's total column covers EVERY item on it (never divide it by one item's quantity). Do not write code."""
 
+CONDITIONS_FIELD = """
+  conditions: [{"quote": "<words COPIED from the ORIGINAL QUESTION>", "meaning": "<the filter they set, in English>"}], one per condition
+      the question states besides its period (item, group, active ingredient, channel, payment method, order status, customer, staff,
+      size, shift...); [] when it states none. The rulebook's defaults are not conditions (they go in rule_refs). A condition you cannot
+      quote from the question is NOT in the question: do not put it in the rewrite, entities, engine_call or method either."""
+
 FIX_NOTE = ("\n\nYOUR PREVIOUS SPEC (JSON) AND WHAT THE CHECKS FOUND - return the FULL corrected spec, same fields:\n")
+
+
+def _quoted(quote: str, question: str) -> bool:
+    """The quote is words of the question: folded (accents may be added to a question typed without them) or both normalised (a
+    quote may write "bn" / "cuwar" out as "bao nhiêu" / "cửa", as the written-out question does)."""
+    from datamate.text import norm
+    for a, b in ((fold_text(quote), fold_text(question)), (norm(quote), norm(question))):
+        if a and re.search(rf"(?<!\w){re.escape(a)}(?!\w)", b):
+            return True
+    return False
+
+
+def check_conditions(s: Spec, question: str) -> list[str]:
+    """Issues for the conditions that do not quote the question; those are dropped from the spec. The quote is checked in code, the
+    way the judge's evidence and the clarity check's quotes are: dev300 q_83273acf61f7 "Doanh thu thuốc hoạt chất Vitamin C" got a
+    rewrite about "prescription drugs", a §6 kê đơn rule and is_prescription in its engine_call, and the Coder answered 0 for 1,235,500;
+    a "prescription" condition has no words of that question to quote."""
+    kept, issues = [], []
+    for c in s.conditions if isinstance(s.conditions, list) else []:
+        if not isinstance(c, dict):
+            issues.append(f"conditions: {str(c)[:80]!r} must be an object {{\"quote\", \"meaning\"}}")
+            continue
+        quote, meaning = str(c.get("quote") or "").strip(), str(c.get("meaning") or "").strip()
+        if quote and _quoted(quote, question):
+            kept.append({"quote": quote, "meaning": meaning})
+            continue
+        issues.append(f"conditions: {meaning or quote!r} quotes {quote!r}, which the question does not say: a condition the question "
+                      "does not state must not be in the spec (rewrite, entities, engine_call, method); remove it, or quote the words "
+                      "of the question that state it")
+    s.conditions = kept
+    return issues
+
+
+def rule_sections(refs, rulebook: str) -> list[str]:
+    """The rulebook sections (headings as written) the spec's `rule_refs` point to, read in code: by number ("§4. ..." -> "4. Công
+    nợ"), else the section of the rulebook row whose label the ref contains ("Bán chạy: ..." -> "3. Xếp hạng"), else a heading whose
+    title it contains. engines/routing.py reads them: a spec citing the debt or stock sections gets no sales hint."""
+    from datamate.agents.guideline import parse_rows
+    heads = [l.lstrip("#").strip() for l in (rulebook or "").splitlines() if l.startswith("#")]
+    by_num = {m.group(1): h for h in heads if (m := re.match(r"(\d+)\.", h))}
+    rows = [(fold_text(r.label), r.section) for r in parse_rows(rulebook or "")]
+    titles = [(fold_text(re.sub(r"^\d+\.\s*", "", h)), h) for h in heads]
+    out: list[str] = []
+    for ref in refs if isinstance(refs, list) else []:
+        f = fold_text(str(ref))
+        m = re.match(r"\s*§?\s*(\d+)\b", str(ref))
+        sec = by_num.get(m.group(1)) if m else None
+        if sec is None:
+            hits = [(len(lab), sec_) for lab, sec_ in rows if len(lab) >= 4 and lab in f]
+            sec = max(hits)[1] if hits else None
+        if sec is None:
+            sec = next((h for t, h in titles if len(t) >= 4 and t in f), None)
+        if sec and sec not in out:
+            out.append(sec)
+    return out
 
 
 def rule_lines(refs, rulebook: str, limit: int = 6) -> list[str]:
@@ -637,11 +703,13 @@ def code_checks(s: Spec, facts, question: str) -> tuple[list[str], list[str]]:
 
 class ExplainerAgent:
     def __init__(self, model, check_model, plan_model, rulebook: str, calendar, max_calls: int = 5, max_checks: int = 2,
-                 mode: str = "loop", plan_mode: str = "call", spec_max_tokens: int = 3000):
+                 mode: str = "loop", plan_mode: str = "call", spec_max_tokens: int = 3000, written_out: bool = False,
+                 conditions: bool = False):
         self.model, self.check_model, self.plan_model = model, check_model, plan_model
         self.rulebook, self.calendar = rulebook, calendar
         self.max_calls, self.max_checks = max_calls, max_checks
         self.mode, self.plan_mode, self.spec_max_tokens = mode, plan_mode, spec_max_tokens   # see run_fast
+        self.written_out, self.conditions = written_out, conditions                           # settings.written_out / spec_conditions
 
     def _context(self, st, tools: DataTools) -> str:
         return (f"RULEBOOK:\n{self.rulebook}\n\nSHOP README:\n{st.ctx.readme[:6000]}\n\nSCHEMA:\n{st.schema}\n\n"
@@ -856,7 +924,12 @@ class ExplainerAgent:
         s, errs, warns, notes = repair_spec(raw, st.ctx.tables, st.as_of, tools, st.question)
         notes += keep_anchored(s, anchored, st.question)
         s.rules = rule_lines(s.rule_refs, self.rulebook) or [str(x) for x in (s.rules or [])]
+        s.rule_sections = rule_sections(s.rule_refs, self.rulebook)
         cnotes, issues = code_checks(s, facts, st.question)
+        if self.conditions:
+            issues += check_conditions(s, st.question)
+        else:
+            s.conditions = []
         benign = [e for e in errs if re.match(r"(table '.+' has no columns|no table ')", e)]
         hard = [e for e in errs if e not in benign]
         return s, hard, issues, notes + cnotes + [settled(e) for e in benign] + [f"warning: {w}" for w in warns]
@@ -871,9 +944,9 @@ class ExplainerAgent:
         question does not name, a period no spec period covers, a list / table disagreement)."""
         from datamate.agents.question import read_question
         tools = DataTools(st.ctx.tables, self.calendar, getattr(st.ctx, "structure", None))
-        facts = read_question(st.question, st.as_of, st.ctx.tables)
+        facts = read_question(st.question, st.as_of, st.ctx.tables, write_out=self.written_out)
         st.named_periods = list(facts.periods)
-        system = SYSTEM_FAST + (METHOD_FIELD if self.plan_mode == "spec" else "")
+        system = SYSTEM_FAST + (CONDITIONS_FIELD if self.conditions else "") + (METHOD_FIELD if self.plan_mode == "spec" else "")
         user = self._fast_prompt(st, facts, tools)
         if feedback:
             user += "\n\nTHE PREVIOUS SPEC WAS JUDGED TO MISREAD THE QUESTION (write a new spec, fix exactly this):\n" + feedback
@@ -885,6 +958,8 @@ class ExplainerAgent:
         if raw is not None:
             s, errs, issues, notes = self._settle(st, raw, tools, facts, anchored)
         log["calls"].append({"call": "spec", "out": raw, "errors": errs, "issues": issues, "notes": notes})
+        if issues and not errs and all(i.startswith("conditions:") for i in issues):
+            log["fix_for_conditions_only"] = True        # what the quote check costs: a fix call no other check asked for
         if raw is None or errs or issues:
             fix = user + FIX_NOTE + (json.dumps(raw, ensure_ascii=False)[:4000] if raw else "(no JSON object was returned)")
             if notes:

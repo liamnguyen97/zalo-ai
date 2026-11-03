@@ -26,9 +26,10 @@ from datetime import date
 from datamate.agents.periods import BALANCE, scan
 from datamate.engines.items import UNIT as UNIT_COL
 from datamate.engines.items import cn
+from datamate import lexicon
 from datamate.lexicon import ENTRIES as _LEXICON
 from datamate.lexicon import glossary
-from datamate.text import SYLLABLE, fold_text, norm  # noqa: F401 - norm is re-exported: facts.py and guideline.py import it from here
+from datamate.text import SYLLABLE, _telex, fold_text, norm, telex_decode  # noqa: F401 - norm is re-exported: facts.py and guideline.py import it from here
 
 # words the readers know: the lexicon's standard forms, and the abbreviations agents/periods.py reads itself ("th 3/25", "so vs")
 LEXICON_WORDS = {w for _, std, _ in _LEXICON for w in fold_text(std).split()} | {"th", "vs"}
@@ -133,6 +134,115 @@ def unknown_words(question: str, tables: dict) -> list[str]:
         if w.isalpha() and len(w) >= 2 and not SYLLABLE.match(w) and w not in known and w not in out:
             out.append(w)
     return out
+
+
+# ---------------------------------------------------------------------------------------------- the question written out
+# The accented form of each lexicon standard the table keeps folded (its readers work on folded text). A standard missing here is not
+# written out, so a new lexicon entry needs a line (tests/test_question_reading.py checks it). Variants with two readings take the one
+# shop questions mean: "kon" = "còn" (còn nợ, còn tồn), "wan" = "quán".
+ACCENTED_STANDARD = {
+    "don hang": "đơn hàng", "doanh thu": "doanh thu", "san pham": "sản phẩm", "chuyen khoan": "chuyển khoản", "tien mat": "tiền mặt",
+    "bao nhieu": "bao nhiêu", "nhieu": "nhiều", "hom nay": "hôm nay", "hom qua": "hôm qua", "truoc": "trước", "duoc": "được",
+    "khong": "không", "gi": "gì", "minh": "mình", "quan": "quán", "gium": "giùm", "giup": "giúp", "trong": "trong", "cho": "cho",
+    "cua": "của", "con": "còn", "cac": "các", "tinh": "tính", "nhan vien": "nhân viên", "nha cung cap": "nhà cung cấp",
+    "nguoi": "người", "nhat": "nhất", "nay": "này", "cod": "COD",
+}
+
+
+def _accented(s: str) -> bool:
+    return any(unicodedata.category(c) == "Mn" for c in unicodedata.normalize("NFD", s)) or "đ" in s.lower()
+
+
+def _written_entries() -> list[tuple[str, str | None]]:
+    """(variant, accented standard), longest variant first, as lexicon.py reads them: a variant written with accents is matched on the
+    lower-case text, the others on the folded text ("đc" is "dc"). Standard None: a protected phrase, kept as written ("mô tô")."""
+    out = []
+    for v, std, _ in _LEXICON:
+        acc = std if _accented(std) else ACCENTED_STANDARD.get(std)
+        if acc:
+            v, acc = unicodedata.normalize("NFC", v).lower(), unicodedata.normalize("NFC", acc)
+            out.append((v, None if fold_text(v) == fold_text(acc) else acc))
+    return sorted(out, key=lambda e: -len(e[0]))
+
+
+TONE_MARKS = frozenset("̣̀́̃̉")             # huyền sắc ngã hỏi nặng (not the hat, breve or horn)
+
+
+def _tones(s: str) -> set[str]:
+    return {c for c in unicodedata.normalize("NFD", s) if c in TONE_MARKS}
+
+
+def _same_length(text: str, fold: bool) -> str:
+    """Lower-case (and, with `fold`, accents removed) one character for one, so match positions hold in the original text."""
+    out = []
+    for c in text:
+        x = c.lower()
+        if fold:
+            x = "".join(d for d in unicodedata.normalize("NFD", x) if unicodedata.category(d) != "Mn").replace("đ", "d")
+        out.append(x if len(x) == 1 else c)
+    return "".join(out)
+
+
+_WRITTEN = _written_entries()
+_SHOP_WORDS: dict[int, frozenset] = {}
+
+
+def shop_words(tables: dict) -> frozenset:
+    """Folded words of the shop's text values (the name index's values, as stored) and column names: "Bia Tiger", "Gas", "Sơn Dulux".
+    Folded with `fold_text`, NOT `norm`: norm's telex rule makes "tiger" "tige" and "gas" "ga", which no question word would match."""
+    key = id(tables)
+    if key not in _SHOP_WORDS:
+        words = {w for t, df in tables.items() for c in df.columns for w in fold_text(c).split()}
+        words |= {w for hits in name_index(tables).values() for (_, _, v) in hits for w in fold_text(v).split()}
+        _SHOP_WORDS[key] = frozenset(words)
+    return _SHOP_WORDS[key]
+
+
+def written_out(question: str, tables: dict | None = None) -> str:
+    """The question with the lexicon's spellings written in full with accents and telex typing decoded, everything else as written:
+    "quý 4/2025 cuwar hàng có bn order ddos" -> "quý 4/2025 cửa hàng có bao nhiêu đơn hàng đó".
+
+    A reading aid for the spec call, shown NEXT TO the original question (QuestionFacts.prompt), never instead of it: quotes, names
+    and the checks in code (explainer._person_in_question, keep_anchored, the judge's evidence) are matched on the original. A word is
+    telex-decoded only when `text._telex` sees a slip in it and the result is ONE Vietnamese syllable ("for" -> "fỏ", "clear" ->
+    "clẻa" are left), it is not a word of the shop's data ("Bia Tiger", "Gas", "Dulux") and not capitalised inside the sentence (a
+    name: "Power Bank", "Air Blade"). On the train / public questions 44.8% / 40.6% of them change; reading the changed words by hand,
+    ~98% of the telex decodings are right."""
+    text = unicodedata.normalize("NFC", question or "")
+    protect = shop_words(tables) if tables else frozenset()
+    if lexicon.ENABLED:
+        low, folded = _same_length(text, False), _same_length(text, True)
+        spans: list[tuple[int, int, str]] = []
+        for v, acc in _WRITTEN:
+            where = low if _accented(v) else folded
+            for m in re.finditer(rf"(?<!\w){re.escape(v)}(?!\w)", where):
+                a, b = m.span()
+                seg = text[a:b]
+                if any(a < y and x < b for x, y, _ in spans):
+                    continue                                       # inside a longer variant already read
+                if fold_text(seg) in protect and (seg.lower() != v or (seg != seg.lower() and text[:a].strip(" ,.:;!?-"))):
+                    continue                                       # a word of the shop's data with its own accents ("áo nỉ") or a name ("áo CK")
+                if acc is not None and not _accented(v) and not _tones(seg) <= _tones(acc):
+                    continue                                       # typed with a tone the standard lacks: "kó" is "có", not "ko" = "không"
+                if acc is None:
+                    spans.append((a, b, text[a:b]))                # protected: "mô tô" is a motorbike, not "nào tô"
+                    continue
+                if acc.endswith(" " + v) and where[:a].endswith(acc[: -len(v)]):
+                    continue                                       # already the standard: "bao nhiêu" keeps its "nhiêu"
+                spans.append((a, b, acc[0].upper() + acc[1:] if text[a].isupper() else acc))
+        for a, b, rep in sorted(spans, reverse=True):
+            text = text[:a] + rep + text[b:]
+
+    def tel(m: re.Match) -> str:
+        w = m.group(0)
+        low = w.lower()
+        if not w.isascii() or not w.isalpha() or low in protect or _telex(low) == low:
+            return w
+        if w[0].isupper() and m.string[: m.start()].strip(" ,.:;!?-"):
+            return w                                               # capitalised inside the sentence: a name ("Power", "Air", "Max")
+        out = telex_decode(w)
+        return out if SYLLABLE.match(fold_text(out)) else w
+    return re.sub(r"\w+", tel, text)
 
 
 INSIDE_MIN_WORDS = 3   # a run of words found INSIDE a longer value needs this many words
@@ -297,10 +407,15 @@ class QuestionFacts:
     periods: list[PeriodMention] = field(default_factory=list)
     glossary: list[tuple[str, str]] = field(default_factory=list)    # datamate/lexicon.py: (word as written, meaning)
     unknown: list[str] = field(default_factory=list)                 # unknown_words: logged only
+    written: str = ""                                                # written_out, when it differs from the question
 
     def prompt(self) -> str:
         """The section the spec call reads: facts the code is sure of, to use instead of guessing."""
-        lines = ["DATA MATCHES (phrases of the question that are values in the shop's data; use these exact spellings):"]
+        lines = []
+        if self.written:
+            lines.append("QUESTION WITH ITS SHORTHAND WRITTEN OUT (by code, a reading aid; names and quotes come from the ORIGINAL "
+                         f"QUESTION, which is the authority): {self.written}")
+        lines.append("DATA MATCHES (phrases of the question that are values in the shop's data; use these exact spellings):")
         for n in self.names:
             where = "; ".join(f"`{t}`.`{c}` = {v!r}" for t, c, v in n.hits[:3]) + (" ..." if len(n.hits) > 3 else "")
             lines.append(f"- \"{n.phrase}\" ({n.how}) -> {where}")
@@ -321,10 +436,13 @@ class QuestionFacts:
                 "reading": self.reading.__dict__ if self.reading else None,
                 "periods": [{"label": p.label, "start": str(p.start), "end": str(p.end)} for p in self.periods],
                 **({"glossary": [list(x) for x in self.glossary]} if self.glossary else {}),
-                **({"unknown_words": self.unknown} if self.unknown else {})}
+                **({"unknown_words": self.unknown} if self.unknown else {}),
+                **({"written_out": self.written} if self.written else {})}
 
 
-def read_question(question: str, as_of: str, tables: dict) -> QuestionFacts:
+def read_question(question: str, as_of: str, tables: dict, write_out: bool = False) -> QuestionFacts:
+    """`write_out`: also the question with its shorthand written out (written_out; settings.written_out)."""
     names = find_names(question, tables)
+    written = written_out(question, tables) if write_out else ""
     return QuestionFacts(names, read_type(question, names, shop_units(tables)), mentioned_periods(question, as_of), glossary(question),
-                         unknown_words(question, tables))
+                         unknown_words(question, tables), written if written != unicodedata.normalize("NFC", question or "") else "")

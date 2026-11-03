@@ -7,7 +7,8 @@ import pandas as pd
 
 from datamate.agents.coder import INSTRUCTIONS, Coder
 from datamate.agents.column_selector import ColumnSelector
-from datamate.agents.explainer import METHOD_FIELD, PLAN_SYSTEM, SYSTEM_FAST, ExplainerAgent, rule_lines
+from datamate.agents.explainer import (CONDITIONS_FIELD, METHOD_FIELD, PLAN_SYSTEM, SYSTEM_FAST, ExplainerAgent, Spec,
+                                      repair_spec, rule_lines, rule_sections)
 from datamate.agents.orchestrator import SYSTEM as ORCH_SYSTEM
 from datamate.agents.orchestrator import Orchestrator
 from datamate.agents.question import find_names, mentioned_periods, read_type
@@ -28,7 +29,7 @@ SPEC = {"rewritten_question": "How many 'Bánh tiramisu' (cái) were sold in May
         "method": "1. filter May 2026\n2. count the item"}
 RULEBOOK = "## 3. Xếp hạng\n| Bán chạy | theo số lượng, đơn hợp lệ |\n| Doanh thu | tổng dòng |"
 RIGHT = "```python\nd = tables['don']\nn = int((d['Tên hàng'] == 'Bánh tiramisu').sum())\nprint(n)\nanswer = n\n```"
-FAST_SYS = (SYSTEM_FAST + METHOD_FIELD, SYSTEM_FAST)
+FAST_SYS = (SYSTEM_FAST + METHOD_FIELD, SYSTEM_FAST, SYSTEM_FAST + CONDITIONS_FIELD + METHOD_FIELD, SYSTEM_FAST + CONDITIONS_FIELD)
 
 
 class Scripted:
@@ -63,8 +64,8 @@ def _st(question="banh tiramisu thang 5 ban dc bn cai"):
     return st
 
 
-def _explainer(m, plan_mode="spec"):
-    return ExplainerAgent(m, m, m, RULEBOOK, pd.DataFrame(), mode="fast", plan_mode=plan_mode)
+def _explainer(m, plan_mode="spec", **kw):
+    return ExplainerAgent(m, m, m, RULEBOOK, pd.DataFrame(), mode="fast", plan_mode=plan_mode, **kw)
 
 
 # ------------------------------------------------------------------ reading the question in code
@@ -127,6 +128,55 @@ def test_a_lost_name_costs_one_fix_call_and_the_better_spec_wins():
     assert m.stages() == ["spec", "spec"]
     assert "TO FIX" in m.seen[1][1] and "'Bánh tiramisu'" in m.seen[1][1]
     assert [e["value"] for e in s.entities] == ["Bánh tiramisu"] and s.status == "clear"
+
+
+def test_a_condition_the_question_does_not_state_costs_a_fix_call_and_is_dropped():
+    """dev300 q_83273acf61f7: "Doanh thu thuốc hoạt chất Vitamin C" was read as prescription drugs only (0 instead of 1,235,500)."""
+    q = "Doanh thu thuốc hoạt chất Vitamin C tháng 5 là bao nhiêu?"
+    vit = {"quote": "hoạt chất Vitamin C", "meaning": "active ingredient = Vitamin C"}
+    added = {**SPEC, "entities": [], "measure": "money", "conditions": [vit, {"quote": "kê đơn", "meaning": "prescription drugs only"}]}
+    m = Scripted(spec=[added, {**added, "conditions": [vit]}])
+    st = _st(q)
+    s = _explainer(m, conditions=True).run(st)
+    assert m.stages() == ["spec", "spec"] and "conditions:" in m.seen[1][1] and "'kê đơn'" in m.seen[1][1]
+    assert s.conditions == [vit] and s.status == "clear" and st.log["explainer"]["fix_for_conditions_only"] is True
+    assert "conditions: [{\"quote\"" in m.systems_seen[0]                                   # the field is asked for
+    # a quote may add the accents a question was typed without, or write its shorthand out
+    s2 = _explainer(Scripted(spec=[{**added, "conditions": [vit]}]), conditions=True).run(_st("dthu thuoc hoat chat vitamin c thang 5 bn"))
+    assert s2.conditions == [vit] and s2.status == "clear"
+    # off (the default): the field is neither asked for nor kept
+    m3 = Scripted(spec=[added])
+    s3 = _explainer(m3).run(_st(q))
+    assert s3.conditions == [] and m3.stages() == ["spec"] and "conditions:" not in m3.systems_seen[0]
+
+
+def test_conditions_go_to_the_coder_and_code_fields_never_come_from_the_model():
+    from datamate.agents.coder import coder_brief
+    s, _, _, _ = repair_spec({**SPEC, "rule_sections": ["4. Công nợ"], "status": "fallback"}, TABLES, "2026-05-31")
+    assert s.rule_sections == [] and s.status == "clear"
+    s.conditions = [{"quote": "size M", "meaning": "size M only"}]
+    body, _ = coder_brief(s)
+    assert '- "size M": size M only' in body and "neither listed here nor stated in the ORIGINAL QUESTION" in body
+    assert "Conditions the question states" not in coder_brief(Spec(rewritten_question="x", answer_type="number"))[0]
+
+
+def test_rule_refs_are_read_as_rulebook_sections():
+    rb = ("## 1. Đơn hàng và doanh thu\n| Đơn bị huỷ | trạng thái huỷ |\n## 3. Xếp hạng\n| Bán chạy | theo số lượng |\n"
+          "## 4. Công nợ\n| Nợ theo khách | như §3 |\n## 6. Theo ngành\n### Nhà thuốc\n| Thuốc kê đơn | danh mục |")
+    refs = ["§4. Công nợ: Nợ theo khách", "Bán chạy: theo số lượng quy về đơn vị cơ bản", "1: Đơn bị huỷ", "Thuốc kê đơn", "không có", "Công nợ"]
+    assert rule_sections(refs, rb) == ["4. Công nợ", "3. Xếp hạng", "1. Đơn hàng và doanh thu", "Nhà thuốc"]
+    st = _st()
+    _explainer(Scripted(spec=[{**SPEC, "rule_refs": ["§3: Bán chạy"]}])).run(st)
+    assert st.brief.rule_sections == ["3. Xếp hạng"]
+
+
+def test_the_spec_call_reads_the_question_written_out_when_asked():
+    m = Scripted()
+    _explainer(m, written_out=True).run(_st("banh tiramisu thangs 5 ban dc bn cai"))
+    assert "WRITTEN OUT" in m.seen[0][1] and "banh tiramisu tháng 5 ban được bao nhiêu cai" in m.seen[0][1]
+    m2 = Scripted()
+    _explainer(m2).run(_st("banh tiramisu thangs 5 ban dc bn cai"))
+    assert "WRITTEN OUT" not in m2.seen[0][1]
 
 
 def test_never_more_than_two_calls_and_unfixed_issues_are_open():
