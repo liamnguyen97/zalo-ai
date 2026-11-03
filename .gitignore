@@ -8,3 +8,4 @@ result/
 /data/
 .DS_Store
 splits/
+/train/
