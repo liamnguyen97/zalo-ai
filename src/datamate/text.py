@@ -28,6 +28,18 @@ def fold_text(s) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s./%-]", " ", s)).strip()
 
 
+# a title written before a person's name in a shop book: "A.Đức", "a Đức", "chị Lan", "c.Hoa", "e Tâm", "cô Ba", "chú Tư"
+HONORIFIC = re.compile(r"^\s*(?:a|anh|c|ch|chi|e|em|co|chu|bac|ong|ba|thay|di|o|cau|mo|sep|bs|ks)\s*[.\s]\s*(?=\S)", re.I)
+
+
+def given_name(name) -> str:
+    """The folded name with a leading title removed ("A.Đức" -> "duc", "chị Lan" -> "lan"). A name that is only one word stays as it is
+    ("Anh", "An"): the title is removed only when a name follows it."""
+    f = fold(name)
+    rest = HONORIFIC.sub("", f, count=1)
+    return rest if rest and rest != f else f
+
+
 # Telex typing left in a word ("naof", "nhaats", "khoong", "quys") is undone (from zalo-challenge `norm_q`).
 FINALS = re.compile(r"(?:[aeiouy]|c|ch|m|n|ng|nh|p|t)$")
 # a folded Vietnamese syllable: initial consonant, 1-3 vowels, final consonant. A trailing tone letter (s f r x j) of a longer token is

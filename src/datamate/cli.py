@@ -115,7 +115,7 @@ def _run(args) -> None:
                      "p2_mode": settings.p2_mode, "plan_mode": settings.plan_mode, "spec_max_tokens": settings.spec_max_tokens,
                      "written_out": settings.written_out, "spec_conditions": settings.spec_conditions,
                      "shared_prefix": settings.shared_prefix, "guideline_rows": settings.guideline_rows,
-                     "verified_facts": settings.verified_facts, "decide_mode": settings.decide_mode,
+                     "verified_facts": settings.verified_facts, "coverage_gate": settings.coverage_gate, "decide_mode": settings.decide_mode,
                      "skip_judge_on_engine": settings.skip_judge_on_engine, "trust_repeat": settings.trust_repeat,
                      "judge_unanswerable": settings.judge_unanswerable, "judge_facts": settings.judge_facts,
                      "judge_periods": settings.judge_periods, "judge_max_tokens": settings.judge_max_tokens, "judge_format": settings.judge_format, "judge_evidence": settings.judge_evidence,

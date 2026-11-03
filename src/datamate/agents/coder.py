@@ -51,6 +51,9 @@ RESOLVED INPUTS, CALCULATION RULES, NOTES, PLAN and OUTPUT (the required answer 
   (cancelled left out); `purchase_avg_price(item, start, end, unit)` = average import price per `unit` (e.g. 'thùng'), weighted by the
   quantity bought; `top_supplier(start, end, k=1)` -> [(supplier, money)]. A slip's total column covers every item on the slip:
   never divide it by one item's quantity.
+- Lots (§6, when listed): `expiring_lots(day, n)` -> [(item, lot, expiry, remaining, money)] of the lots still in stock at `day`
+  expiring in [day, day + n]; `expiring_items(day, n)` -> item names (earliest expiry first); `expiring_value(day, n)` -> money of
+  that stock at each lot's own import price; `nearest_expiry(item, day)` -> expiry date of the item's first-expiring lot in stock.
 The functions of THIS shop are listed under "AVAILABLE FUNCTIONS" in the task: CALL them directly (do not test with
 dir()/globals()); a function that is not listed means this shop has no data for it. Use a function when the task asks exactly
 that quantity; a function cannot take extra conditions: then use `sales_orders` / `item_lines`.

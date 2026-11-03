@@ -80,6 +80,7 @@ class DebtView:
     orders: pd.DataFrame    # order, day, total, credit, debt_ok, cust, name
     payments: pd.DataFrame  # order, day, amount
     source: str
+    flows = True            # dated payments exist: repayments / new debt of a period can be computed
 
     # ---- balances ------------------------------------------------------------------------------------------------
     def balances(self, day) -> pd.DataFrame:
@@ -187,9 +188,18 @@ def _declared_code(biz: Business, octable: str, orders: pd.DataFrame) -> str | N
     return col if _ids(orders[col].dropna()).replace("", pd.NA).dropna().nunique() >= 2 else None
 
 
+# "không ghi tên khách", "không ghi khách": the shop's README says its book records no customer (dev_012's repair book; without this
+# the column of jobs done, `Làm gì`, passed for 3,188 customers' names)
+NO_CUSTOMER = re.compile(r"kh[ôo]ng (?:ghi|c[óo]|l[ưu]u) (?:t[êe]n )?kh[áa]ch(?! (?:l[ẻe]|h[àa]ng l[ẻe]))", re.I)
+
+
 def _customer(biz: Business, orders: pd.DataFrame, octable: str) -> tuple[pd.Series, pd.Series]:
     """(customer key, display name) per order row. Shops with customer codes: one customer per code, name from the
-    customer list (or the order's name column). Shops without codes: the name is the key, spelling-folded (§3)."""
+    customer list (or the order's name column). Shops without codes: the name is the key, spelling-folded (§3). A shop whose
+    README says it records no customer has none: every order is a walk-in."""
+    if NO_CUSTOMER.search(biz.readme or ""):
+        blank = pd.Series("", index=orders.index)
+        return blank, blank
     texts = _text_cols(orders)
     declared = _declared_code(biz, octable, orders)
     if declared is not None:
@@ -275,3 +285,127 @@ def build_debt(biz: Business) -> DebtView | None:
                              "amount": pd.to_numeric(p[pay_col], errors="coerce").fillna(0).values})
     return DebtView(orders.dropna(subset=["day"]), payments.dropna(subset=["day"]),
                     f"đơn `{ot}` (tổng phải trả `{total_col}`, ngày `{odate}`), phiếu thu `{pt}` (tiền `{pay_col}`, ngày `{pdate}`)")
+
+
+# ---------------------------------------------------------------------------------------------- debt recorded on the order itself
+# Shops with no payment records keep what each order still owes on the order: a column (`Còn nợ`, `Nợ`: "số khách còn nợ của đơn",
+# dev_007 / dev_009 and 4 training shops) or the order's note ("đơn ghi nợ thì ghi khách đã đưa / còn thiếu bao nhiêu", dev_008:
+# "ghi nợ 1.038.500đ, đã trả đủ", "ck 913 nghìn, thiếu lại 456.500đ", "ghi sổ 443 nghìn"). The README says it is the state at the end of
+# the data. So the balance is known on the last day of the data (or later) and not before it: `balances` refuses an earlier day, and
+# there is no repayment / new-debt flow (no dated payment exists).
+OWED_DESC = re.compile(r"^(?:s[ốo] (?:ti[ềe]n )?)?(?:kh[áa]ch )?c[òo]n n[ợo]\b|^n[ợo] c[òo]n l[ạa]i\b|^d[ưu] n[ợo]\b", re.I)
+NOTE_DEBT_DESC = re.compile(r"ghi n[ợo].*(?:c[òo]n thi[ếe]u|đ[ãa] đ[ưu]a|c[òo]n n[ợo])|(?:c[òo]n thi[ếe]u|c[òo]n n[ợo]).*ghi ch[úu]", re.I)
+_AMOUNT = r"(\d+(?:[.,]\d{3})+(?:\s*(?:đ|d|vnd|dong))?|\d+\s*tr\s*\d*|\d+(?:[.,]\d+)?\s*(?:k|nghin|ngan|tr|trieu|đ|d)\b|\d{4,})"
+PAID_FULL = re.compile(r"(?:da )?(?:tra|ck|chuyen khoan|thanh toan|dua) (?:du|het|xong|ca)\b|\bdu roi\b|\bhet roi\b")
+STILL_OWED = re.compile(rf"(?:con thieu|thieu lai|con no|no lai|thieu|con lai)\s*{_AMOUNT}")
+OWED_AMOUNT = re.compile(rf"(?:ghi no|no|ghi so|chiu)\s*{_AMOUNT}")
+PAID_PART = re.compile(rf"(?:dua truoc|tra truoc|dua|tra|ck|chuyen khoan)\s*{_AMOUNT}")
+WHOLE_ORDER = re.compile(r"\bno ca don\b|\bghi so ca don\b|\bchua tra\b(?!.*\d)|^\s*(?:ghi no|ghi so|no)\s*$")
+
+
+def _money(text: str) -> float | None:
+    from datamate.data.loader import MONEY_K, MONEY_TR, MONEY_TR_DEC
+    t = re.sub(r"\s*(?:đ|d|vnd|dong)\s*$", "", text.strip())
+    t = re.sub(r"\s*(?:nghin|ngan)$", "k", t)
+    t = re.sub(r"\s*trieu$", "tr", t)
+    for pat, mul in ((MONEY_TR_DEC, 1e6), (MONEY_K, 1e3)):
+        if (m := pat.fullmatch(t)) and not re.search(r"tr\s*\d", t):
+            return float(m.group(1).replace(",", ".")) * mul
+    if (m := MONEY_TR.fullmatch(t)):
+        return float(f"{m.group(1)}.{m.group(2) or '0'}") * 1e6
+    digits = re.sub(r"[.,]", "", t)
+    return float(digits) if digits.isdigit() else None
+
+
+def owed_from_note(note, total: float) -> float | None:
+    """What the order still owes, read from its note (folded); None when the note says nothing about it."""
+    if note is None or (isinstance(note, float) and pd.isna(note)):
+        return None
+    t = fold(str(note))
+    if m := STILL_OWED.search(t):
+        return _money(m.group(1))
+    if PAID_FULL.search(t):
+        return 0.0
+    if m := OWED_AMOUNT.search(t):
+        return _money(m.group(1))
+    if re.search(r"con lai (?:ghi so|ghi no|no)", t) and (m := PAID_PART.search(t)) and (paid := _money(m.group(1))) is not None:
+        return max(total - paid, 0.0)
+    if WHOLE_ORDER.search(t):
+        return float(total)
+    return None
+
+
+class SnapshotDebt(DebtView):
+    """Debt known only as each order's state at the end of the data (`last`)."""
+    flows = False
+
+    def __init__(self, orders: pd.DataFrame, source: str, last: pd.Timestamp):
+        super().__init__(orders, pd.DataFrame({"order": [], "day": pd.to_datetime([]), "amount": []}), source)
+        self.last = pd.Timestamp(last).normalize()
+
+    def balances(self, day) -> pd.DataFrame:
+        if pd.Timestamp(day).normalize() < self.last:
+            raise ValueError(f"this shop records what each order still owes only as of the end of its data ({self.last.date()}); "
+                             f"the balance on {pd.Timestamp(day).date()} is not recorded")
+        return super().balances(day)
+
+    def repaid(self, start, end, customer=None) -> int:
+        raise ValueError("this shop records no dated payments: repayments in a period are not recorded")
+
+    def new_debt(self, start, end, customer=None) -> int:
+        raise ValueError("this shop records no dated payments: new debt in a period is not recorded")
+
+
+def _declared(biz: Business, pattern: re.Pattern) -> tuple[str, str] | None:
+    """(table, column) whose README description matches `pattern`."""
+    from datamate.data.readme import parse_column_docs, roles_for_tables as _rft  # noqa: F401 - same module family
+    docs = [d for d in parse_column_docs(biz.readme) if pattern.search(d.desc)]
+    for d in docs:
+        for t, df in biz.tables.items():
+            if d.column in df.columns:
+                return t, d.column
+    return None
+
+
+def build_snapshot_debt(biz: Business) -> DebtView | None:
+    """The debt view of a shop that writes what each order owes on the order (a column, or the note), as of the end of its data."""
+    found, from_note = _declared(biz, OWED_DESC), False
+    if found is None:
+        found, from_note = _declared(biz, NOTE_DEBT_DESC), True
+    if found is None:
+        return None
+    t, col = found
+    o = biz.tables[t]
+    oc = find_order_col(o)
+    if oc is None:
+        return None
+    o = o.assign(**{oc: _ids(o[oc])}).drop_duplicates(oc)
+    roles = roles_for_tables(biz.readme, {t: list(o.columns)}).get(t, {})
+    odate = roles.get("order_date") if roles.get("order_date") in o.columns else _date_col(o)
+    if odate is None:
+        return None
+    total_col = next((c for c in o.columns if re.search(r"t[ổo]ng (?:ti[ềe]n|thanh to[áa]n|c[ộo]ng)|tong tien|ph[ảa]i tr[ảa]|c[ầa]n tr[ảa]", str(c), re.I)
+                      and pd.api.types.is_numeric_dtype(o[c])), None)
+    total = pd.to_numeric(o[total_col], errors="coerce").fillna(0) if total_col else pd.Series(0.0, index=o.index)
+    if from_note:
+        owed = pd.Series([owed_from_note(n, tt) for n, tt in zip(o[col], total)], index=o.index, dtype="float64").fillna(0)
+    else:
+        owed = pd.to_numeric(o[col], errors="coerce").fillna(0)
+    if not (owed > 0).any():
+        return None
+    declared = roles.get("payment_method")
+    texts = _text_cols(o)
+    method = declared if declared in texts else next((c for c in texts if METHOD_COL.search(c)), None)
+    channel = next((c for c in texts if CHANNEL_COL.search(c)), None)
+    mfold = o[method].map(fold) if method else pd.Series("", index=o.index)
+    cfold = o[channel].map(fold) if channel else pd.Series("", index=o.index)
+    status = o["status_std"] if "status_std" in o.columns else pd.Series("completed", index=o.index)
+    cust, name = _customer(biz, o, t)
+    days = _day(o[odate])
+    orders = pd.DataFrame({
+        "order": o[oc].values, "day": days.values, "total": owed.values, "credit": (owed > 0).values,
+        "debt_ok": ((status != "cancelled") & ~mfold.str.contains(NOT_DEBT_CHANNEL) & ~cfold.str.contains(NOT_DEBT_CHANNEL)).values,
+        "cust": cust.values, "name": name.astype(str).map(_clean_name).values})
+    where = f"ghi chú `{col}`" if from_note else f"cột `{col}`"
+    return SnapshotDebt(orders.dropna(subset=["day"]), f"nợ còn lại của mỗi đơn ở {where} của `{t}` (tình trạng tính đến hết ngày "
+                        f"cuối dữ liệu, {days.max().date()}; ngày `{odate}`)", days.max())

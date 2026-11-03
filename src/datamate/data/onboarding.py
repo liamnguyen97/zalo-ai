@@ -33,10 +33,12 @@ def onboard(biz, sales, items, debt, orders, purchases=None) -> dict:
             lines = sales.lines
             rep["sales"] = {"table": sales.table, "order_col": sales.order_col, "date_col": sales.date_col,
                             "amount_col": sales.amount_col, "source": sales.source, "rows": len(lines)}
-            ledger = bool(re.search(r"không ghi (mã|số) đơn|không có (mã|số) đơn|không ghi mã hóa đơn", biz.readme or "", re.I))
-            ck.append(_check("order_col_found", sales.order_col is not None or ledger,
+            ledger = bool(re.search(r"không (?:ghi|có) (?:mã|số) (?:đơn|phiếu|hoá đơn|hóa đơn)", biz.readme or "", re.I))
+            rows = getattr(sales, "row_docs", False)
+            ck.append(_check("order_col_found", sales.order_col is not None or ledger or rows,
                              f"order column: {sales.order_col}" if sales.order_col else
-                             ("ledger: the README says the shop records no order id (each row is one record)" if ledger else
+                             ("one row per document: each row of the book is one order (no order id)" if rows else
+                              "ledger: the README says the shop records no order id (each row is one record)" if ledger else
                               "no order id column found and the README does not say the shop has none")))
             nat = float(lines["date"].isna().mean())
             span = (lines["date"].max() - lines["date"].min()).days if lines["date"].notna().any() else 0

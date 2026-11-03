@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from datamate.data.readme import roles_for_tables
+from datamate.data.readme import roles_for_tables, same_order_cols
 from datamate.data.status import add_status_std, find_order_col, payment_labels
 
 DATE_HINT = re.compile(r"ng[àa]y|date|h[ạa]n|th[ờo]i ?gian|time", re.I)
@@ -25,7 +25,7 @@ NUMDAYS_HINT = re.compile(r"s[ốo] ng[àa]y|ng[àa]y n[ợo]|ng[àa]y c[ôo]ng|
 FILL_HINT = re.compile(
     r"ng[àa]y|date|th[ờo]i ?gian|kh[áa]ch|customer|tr[ạa]ng th[áa]i|status|k[ếe]t qu[ảa]|ti[ếe]n [đd][ộo]|ghi ch[úu]|note"
     r"|k[êe]nh|channel|nh[âa]n vi[êe]n|thu ng[âa]n|h[ìi]nh th[ứu]c|thanh to[áa]n|payment|[đd][ốo]i t[áa]c", re.I)
-ID_HINT = re.compile(r"\bm[ãa]\b|barcode|code|s[ốo] [đd]i[ệe]n tho[ạa]i|sdt|phone|\bid\b", re.I)
+ID_HINT = re.compile(r"\bm[ãa]\b|barcode|code|s[ốo] [đd]i[ệe]n tho[ạa]i|sdt|s[đd]t|phone|\bid\b|imei|serial|s[ốo] seri", re.I)
 MONEY_TR = re.compile(r"\s*(\d+)\s*tr\s*(\d*)\s*", re.I)          # 1tr440 = 1,440,000 ; 2tr = 2,000,000
 MONEY_TR_DEC = re.compile(r"\s*(\d+(?:[.,]\d+)?)\s*(?:tr|tri[ệe]u)\s*", re.I)  # "1,19tr" = 1,190,000 ; "2 triệu" = 2,000,000
 MONEY_K = re.compile(r"\s*(\d+(?:[.,]\d+)?)\s*k\s*", re.I)          # 55k = 55,000
@@ -46,6 +46,7 @@ class Business:
     readme: str
     tables: dict[str, pd.DataFrame] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    expansions: list = field(default_factory=list)   # data/aliases.Expansion: item names written in full from an abbreviation sheet
 
 
 def _detect_header(raw: pd.DataFrame, scan: int = 15) -> int:
@@ -180,7 +181,9 @@ def _clean(df: pd.DataFrame, year_hint: int | None = None) -> pd.DataFrame:
         num = _to_number(s)  # "Số ngày được nợ" holds 30/60, not dates
         if num is not None:
             df[col] = num
-    return df.reset_index(drop=True)
+    # a row left with no value at all is no record: a footnote under the table ("Ghi chú: số liệu ghi tay") whose only text sat in
+    # the date column (dev_014: one per month sheet). Kept, it became a blank line of the last order of the sheet
+    return df.dropna(how="all").reset_index(drop=True)
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
@@ -278,6 +281,131 @@ def _merge_across_files(frames: dict[str, pd.DataFrame]) -> dict[str, pd.DataFra
     return out
 
 
+MIN_ORDERS = 20          # orders needed before a running number is read as an order number
+STEP_SHARE = 0.98        # share of steps (row to row) that must be +0 / +1, or a restart where the sheet / day changes
+
+
+def _as_int(s: pd.Series) -> pd.Series | None:
+    """Whole numbers >= 0 (float, int or digit text) with NaN where blank; None when a filled cell is anything else."""
+    if pd.api.types.is_datetime64_any_dtype(s) or s.dtype.kind == "b":
+        return None
+    v = s.astype(float) if s.dtype.kind in "iuf" else pd.to_numeric(s.astype(str).str.strip().where(s.notna()), errors="coerce")
+    if v.notna().sum() < s.notna().sum() or v.notna().sum() == 0:
+        return None
+    x = v.dropna()
+    return v if bool(((x % 1) == 0).all() and (x >= 0).all()) else None
+
+
+DOC_DATE = re.compile(r"ng[àa]y|date|th[ờo]i ?gian", re.I)
+NOT_DOC_DATE = re.compile(r"h[ạa]n|expir|sinh|v[àa]o l[àa]m|đ[ăa]ng k[ýy]", re.I)   # due / expiry / birth / hire dates
+
+
+def _doc_date(df: pd.DataFrame) -> str | None:
+    """The date of the record (sale date), not a due, expiry or birth date."""
+    for c in df.columns:
+        if (pd.api.types.is_datetime64_any_dtype(df[c]) and df[c].notna().mean() > 0.5 and DOC_DATE.search(str(c))
+                and not NOT_DOC_DATE.search(str(c))):
+            return c
+    return None
+
+
+def _has_doc_key(df: pd.DataFrame, skip: str) -> str | None:
+    """A text column that already groups the rows into documents: repeated values stored in runs (biz_119's purchase lines are
+    keyed by `Mã nhập hàng`, their `STT` numbers the lines of each slip)."""
+    n = len(df)
+    for c in df.columns:
+        if c in (skip, "source_sheet") or not _is_text(df[c]):
+            continue
+        s = df[c].dropna().astype(str)
+        nu = s.nunique()
+        if len(s) < 0.9 * n or nu < MIN_ORDERS or nu >= 0.9 * len(s):
+            continue
+        if int((s != s.shift()).sum()) <= 1.1 * nu:
+            return c
+    return None
+
+
+def _boundaries(df: pd.DataFrame, rows: pd.Index) -> pd.Series:
+    """True on a row (of `rows`) whose sheet or day differs from the previous one of `rows`: where a running number may restart."""
+    out = pd.Series(False, index=rows)
+    if "source_sheet" in df.columns:
+        sh = df.loc[rows, "source_sheet"].astype(str)
+        out |= sh != sh.shift()
+    if (c := _doc_date(df)) is not None:
+        d = df[c].ffill().dt.normalize().loc[rows]
+        out |= d != d.shift()
+    return out
+
+
+def _running_number(df: pd.DataFrame, col: str, declared: bool) -> pd.Series | None:
+    """Order numbers from a running-number column (`STT` = "số thứ tự đơn"): the number of each row's order, blank lines taking
+    the order above. Read from the values, not the name: whole numbers that grow by 0 (another line of the same order) or 1 (the
+    next order) from row to row, restarting only where the sheet or the day changes, with fewer distinct numbers than rows (some
+    order has two lines; a plain row counter is no order). A day-of-month column has the same steps but changes exactly with the
+    date: refused. `declared` (the README names the column) skips the step test."""
+    v = _as_int(df[col])
+    if v is None:
+        return None
+    filled = v.dropna()
+    nu, n_orders = filled.nunique(), int((filled != filled.shift()).sum())
+    # enough orders (a book restarting every day has few distinct numbers but many orders), fewer numbers than rows
+    if nu < 2 or n_orders < (2 if declared else MIN_ORDERS) or nu >= 0.9 * len(df):
+        return None
+    if not declared:
+        if _has_doc_key(df, col) is not None:      # the rows already have a document id: this numbers lines within it
+            return None
+        step = filled.diff().iloc[1:]
+        bound = _boundaries(df, filled.index).iloc[1:]
+        plain = step.isin([0.0, 1.0])
+        restart = ~plain & bound & (filled.iloc[1:] <= 1)
+        bad = ~plain & ~restart
+        # a few typing slips are tolerated, a number going back anywhere but at a new sheet / day is not (a line number restarts
+        # at every document)
+        if bad.mean() > 1 - STEP_SHARE or int((bad & (step < 0)).sum()) > max(2, 0.002 * len(step)) or (step == 1).sum() < MIN_ORDERS - 1:
+            return None
+        dates = _doc_date(df)
+        if dates is not None:
+            per_day = filled.groupby(df.loc[filled.index, dates].dt.normalize()).nunique()
+            if len(per_day) and (per_day > 1).mean() < 0.3:      # one number per day: a day number, not an order number
+                return None
+    return v.ffill()
+
+
+def derive_order_ids(df: pd.DataFrame, declared: set[str] = frozenset(), preferred: set[str] = frozenset()) -> tuple[pd.DataFrame, str | None]:
+    """A shop book with no order-id column but a running order number (`STT`: written once on the first line of an order, or on
+    every line) gets a text column `Mã đơn (STT)` that holds the order of every row, so the order-level steps (forward-fill of the
+    order's cells, duplicate lines, the order's status, `sales_orders`) work as for any order id. dev_011 / dev_014 (103 public
+    questions) had no `sales_orders` and every engine off. The id is the number itself (other books refer to it: "STT 26", `Trừ vào
+    (STT sổ bán)`); only when a number comes back in a later, separate run (a book restarting each sheet / day) is the sheet or day
+    put in front of it. `declared`: the column the README documents for this table as the order number (no step test);
+    `preferred`: columns a README sentence says group an order's rows ("các dòng cùng **STT** là một đơn"). The sentence names no
+    table, and dev_014's instalment book has an `STT` too (the sales order each instalment belongs to: 33, 33, 54...), so those are
+    tried first but must pass the step test."""
+    if len(df) < 2 or find_order_col(df) is not None:
+        return df, None
+    first = [c for c in df.columns if c in declared] + [c for c in df.columns if c in preferred and c not in declared]
+    cands = first + [c for c in df.columns if c not in first and c not in ("source_sheet",)]
+    for col in cands:
+        num = _running_number(df, col, col in declared)
+        if num is None:
+            continue
+        txt = num.map(lambda x: "" if pd.isna(x) else str(int(x)))
+        runs = (txt != txt.shift()).cumsum()
+        if (runs.groupby(txt).nunique() > 1).any():          # the same number in two separate runs: a restarting book
+            if "source_sheet" in df.columns and (runs.groupby([df["source_sheet"].astype(str), txt]).nunique() <= 1).all():
+                txt = df["source_sheet"].astype(str) + "/" + txt
+            else:
+                dates = _doc_date(df)
+                if dates is None:
+                    continue
+                txt = df[dates].ffill().dt.strftime("%Y-%m-%d") + "/" + txt
+        name = f"Mã đơn ({col})"
+        out = df.copy()
+        out.insert(list(df.columns).index(col) + 1, name, txt.where(num.notna()).values)
+        return out, name
+    return df, None
+
+
 def _fill_groups(df: pd.DataFrame) -> pd.DataFrame:
     """Rulebook §8: blank order-level cells on later rows of an order equal the first row's."""
     oc = find_order_col(df)
@@ -348,7 +476,13 @@ def load_business(biz_dir: str | Path) -> Business:
     merged = _merge_split_tables(frames)
     declared = roles_for_tables(biz.readme, {k: list(v.columns) for k, v in merged.items()})
     paid = payment_labels(merged, declared)       # "khách trả <a payment method of this shop>" in a note is a payment, not a return
+    same_order = same_order_cols(biz.readme)
+    derived: dict[str, tuple[str, str]] = {}
     for k, v in merged.items():
+        named = {declared[k]["order_no"]} if "order_no" in declared.get(k, {}) else set()
+        v, oid = derive_order_ids(v, named, same_order)
+        if oid is not None:
+            derived[k] = (oid, oid[len("Mã đơn ("):-1])
         v, n_dup = drop_consecutive_duplicates(_fill_groups(v))
         if n_dup:
             dropped[f"{k}:dup"] = n_dup
@@ -358,4 +492,11 @@ def load_business(biz_dir: str | Path) -> Business:
          else f"`{k}`: removed {n} summary rows (Tổng ngày/Cộng ngày/Tổng tháng...) because they are not orders")
         for k, n in dropped.items() if n
     ]
+    from datamate.data.aliases import expand_abbreviations, expand_nicknames   # imported here: data/text helpers only, loaded last
+    biz.tables, biz.expansions = expand_abbreviations(biz.tables, declared)
+    biz.tables, nicknames = expand_nicknames(biz.tables)
+    biz.notes += [e.note() for e in biz.expansions] + [n.note() for n in nicknames]
+    biz.notes += [f"`{k}`: no order-id column; `{oid}` gives every line its order: the order number `{src}`, carried down to the "
+                  f"lines where `{src}` is blank. One order = one `{oid}`; the order's own cells (customer, note, status) are copied "
+                  "to all its lines" for k, (oid, src) in derived.items()]
     return biz

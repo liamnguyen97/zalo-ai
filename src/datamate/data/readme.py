@@ -27,6 +27,8 @@ ITEM = re.compile(r"^-\s+\*\*(.+?)\*\*\s*:\s*(.+)$")
 ROLES: list[tuple[str, re.Pattern]] = [
     ("line_amount", re.compile(r"^th[àa]nh ti[ềe]n (?:sau gi[ảa]m|c[ủu]a d[òo]ng)|^th[àa]nh ti[ềe]n$", re.I)),
     ("order_id", re.compile(r"^m[ãa] đ[ơo]n$", re.I)),
+    # "số thứ tự đơn (hoá đơn) trong sổ": a running number written on the first line of each order (dev_011 `STT`)
+    ("order_no", re.compile(r"^s[ốo] th[ứu] t[ựu] (?:c[ủu]a )?(?:đ[ơo]n|h[óo]a đ[ơo]n|ho[áa] đ[ơo]n|phi[ếe]u)", re.I)),
     ("order_date", re.compile(r"^ng[àa]y b[áa]n\b", re.I)),
     ("order_status", re.compile(r"^tr[ạa]ng th[áa]i đ[ơo]n$", re.I)),
     ("qty_base", re.compile(r"đ[ãa] đ[ổo]i ra đ[ơo]n v[ịi] c[ơo] b[ảa]n|s[ốo] l[ưu][ợo]ng.*c[ơo] b[ảa]n", re.I)),
@@ -44,6 +46,25 @@ ROLES: list[tuple[str, re.Pattern]] = [
     ("conv_ratio", re.compile(r"^h[ệe] s[ốo]\b", re.I)),
     ("large_unit", re.compile(r"^đ[ơo]n v[ịi] l[ớo]n\b|^đ[ơo]n v[ịi] quy đ[ổo]i", re.I)),
 ]
+
+# "**Đơn**: các dòng cùng **STT** là một đơn" (dev_014): the column whose equal values make one order
+SAME_ORDER = re.compile(r"c[áa]c d[òo]ng (?:c[óo] )?c[ùu]ng \*\*([^*]{1,40})\*\* (?:l[àa]|thu[ộo]c) (?:m[ộo]t|1) "
+                        r"(?:đ[ơo]n|h[óo]a đ[ơo]n|ho[áa] đ[ơo]n|phi[ếe]u)", re.I)
+# "mỗi dòng một lượt xe vào sửa (một phiếu)", "mỗi dòng là một đơn": each row is a whole document. Not "mỗi dòng một mặt hàng ...",
+# which is one LINE of a document (biz_107 / dev_011)
+ROW_DOCUMENT = re.compile(r"m[ỗo]i d[òo]ng (?:l[àa] )?(?:m[ộo]t|1) (?:l[ưu][ợo]t|phi[ếe]u|đ[ơo]n|h[óo]a đ[ơo]n|ho[áa] đ[ơo]n|giao d[ịi]ch)\b",
+                          re.I)
+
+
+def same_order_cols(readme: str) -> set[str]:
+    """Columns the README says group rows into one order ("các dòng cùng **STT** là một đơn")."""
+    return {m.group(1).strip() for m in SAME_ORDER.finditer(readme or "")}
+
+
+def row_documents(readme: str) -> bool:
+    """The README says each row is one whole document (an order, a repair slip)."""
+    return bool(ROW_DOCUMENT.search(readme or ""))
+
 
 # README sentences such as "- Bia Tiger lon: 1 thùng = 24 lon" (conversion list written in the Quy ước section)
 CONV_LINE = re.compile(r"^\s*-\s*(.+?):\s*1\s+([^=]+?)\s*=\s*([\d.,]+)\s*(.+?)\s*$")

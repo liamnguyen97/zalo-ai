@@ -4,7 +4,8 @@ The Coder spends blocks printing what the data holds (date range, rows after eac
 looks like a real 0: on dev300 q_b445c50f6b5e the morning revenue came out 0 in a month that had morning orders, the Coder
 concluded UNANSWERABLE and was bounced, then stalled (ledger #9). These counts are cheap and exact, so the Coder starts from them:
 - the data range of `sales_orders` (order date);
-- per period (the same `period_*` / `compare_*` the sandbox holds): orders placed by `status_std`, and how many are valid;
+- per period (the same `period_*` / `compare_*` the sandbox holds): orders placed by `status_std`, and how many are valid; a
+  period only partly inside the data's dates is said to be computed on the part with data (§7);
 - valid orders per `shift` when the question names a shift; valid orders per value of a spec entity that is an order column;
 - valid sales lines of each spec item in the main period.
 Counts only, never an amount: an amount would be a ready answer that ignores the question's other conditions.
@@ -58,6 +59,11 @@ def _facts(question: str, spec, variables: dict) -> list[str]:
         valid = w[w["valid"].astype(bool)]
         out.append(f"- {role} {_day(lo)}..{_day(hi)}: {len(w)} orders placed{status}, {len(valid)} valid."
                    + ("" if len(w) else " No order in this period: no data is not 0 (rulebook §7)."))
+        first, last = d.min().normalize(), d.max().normalize()
+        if len(w) and (pd.Timestamp(lo).normalize() < first or pd.Timestamp(hi).normalize() > last):
+            # §7: a period only partly inside the data's dates is computed on the part that has data (not unanswerable, not scaled)
+            out.append(f"  only part of this period has data (orders {_day(first)}..{_day(last)}): compute on that part, as the "
+                       "rulebook says (§7); it is NOT unanswerable.")
         if asks_shift and len(valid):
             sc = valid["shift"].fillna("(outside both shifts)").value_counts()
             out.append("  valid orders by `sales_orders['shift']`: " + ", ".join(f"{k} {int(n)}" for k, n in sc.items()))

@@ -100,6 +100,11 @@ class Settings:
     # counts computed from the data for the question's periods (VERIFIED FACTS).
     guideline_rows: int = field(default_factory=lambda: int(os.getenv("DATAMATE_GUIDELINE_ROWS", "4")))
     verified_facts: bool = field(default_factory=lambda: _flag("DATAMATE_VERIFIED_FACTS", True))
+    # §7 information coverage (agents/coverage.missing_information): a question asking for a kind of information the shop does not
+    # record (gender, address, stock, purchases, cost, debt, expiry, named customers). fact (default) = a line in the Coder's VERIFIED
+    # FACTS, the Coder and the judge decide; on = UNANSWERABLE in code before any model call for the needs measured precise (train: 28
+    # fires, all on gold-unanswerable questions; unseen shops may name their columns otherwise); off = not run.
+    coverage_gate: str = field(default_factory=lambda: os.getenv("DATAMATE_COVERAGE_GATE", "fact"))
 
     # P4 / P5 (ledger #12). After a rejected turn: "rule" = a rule table on the verdicts picks coder / explainer / abstain (no model
     # call), "model" = the orchestrator model picks, as before (the rule's choice is logged as `rule_would`). No judge call when the

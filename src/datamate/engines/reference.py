@@ -33,8 +33,50 @@ METRIC_KEYS = {"orders": "orders", "order_count": "orders", "n_orders": "orders"
                "avg_order_value": "avg_order", "average_order_value": "avg_order", "avg_revenue_per_order": "avg_order", "aov": "avg_order"}
 CALLS = ("sales_metrics", "item_qty", "item_revenue", "top_items", "item_price_on", "item_qty_change", "size_qty",
          "debt_total", "debt_by_customer", "debt_customers", "debt_aging", "debt_repaid", "debt_new", "top_customers",
-         "purchase_total", "purchase_avg_price", "top_supplier", "cancel_rate")
+         "purchase_total", "purchase_avg_price", "top_supplier", "cancel_rate", "expiring_items", "expiring_value", "nearest_expiry")
 DATE_ARGS = ("start", "end", "day")
+
+# What each function's value IS, in the spec's measure words (agents/explainer.MEASURES): the reference must be the same kind of
+# value as the answer. dev300 run 20261103-070503: 8 of the 9 `engine_mismatch` were a reference of another kind: `cancel_rate` (a
+# percent) for "tháng 10 bị huỷ mấy đơn" (6 questions), `size_qty(size='ca chiều')` (a quantity, and no such size) for a revenue
+# percent, `top_customers` (ranks by revenue) for "khách nào mua nhiều đơn nhất"; the Coder was right on all 8 and was told it was
+# wrong. A tuple is "any of these" (a change dict is both a quantity and its percent).
+RETURNS: dict[str, str | tuple[str, ...] | None] = {
+    "sales_metrics": None, "item_qty": "quantity", "item_revenue": "money", "top_items": None, "item_price_on": "money",
+    "item_qty_change": ("quantity", "ratio"), "size_qty": "quantity", "debt_total": "money", "debt_by_customer": "money",
+    "debt_customers": "count", "debt_aging": "money", "debt_repaid": "money", "debt_new": "money", "top_customers": "money",
+    "purchase_total": "money", "purchase_avg_price": "money", "top_supplier": "money", "cancel_rate": "ratio",
+    "expiring_items": None, "expiring_value": "money", "nearest_expiry": "date", "expiring_lots": None,
+}
+KEY_MEASURE = {"revenue": "money", "orders": "orders", "avg_order": "money"}
+SAME = ({"orders", "count"},)          # an order count is a count of distinct objects
+JUDGED = ("quantity", "money", "orders", "count", "ratio")   # the measures a conflict is judged on (not name / date / other)
+
+
+def value_kind(function: str, args: dict, key: str | None = None) -> tuple[str, ...]:
+    """The measures the function's value can be ((), unknown: a dict of several metrics)."""
+    if key is not None:
+        return (KEY_MEASURE[key],) if key in KEY_MEASURE else ()
+    if function == "top_items":
+        return ("quantity",) if str(args.get("by", "qty")) == "qty" else ("money",)
+    m = RETURNS.get(function)
+    return () if m is None else (m,) if isinstance(m, str) else tuple(m)
+
+
+def kind_conflict(function: str, args: dict, key: str | None, answer_type: str | None, measure: str | None) -> str:
+    """Why the function's value is not the kind of answer the spec asks for ("" = it may be). Judged on the spec's own structured
+    fields (answer type, measure), the same ones the Coder is given: a percent is no answer to a count, a quantity none to a percent,
+    a revenue ranking none to a ranking by order count."""
+    kinds = value_kind(function, args, key)
+    if not kinds:
+        return ""
+    if "ratio" in kinds and len(kinds) == 1 and answer_type != "percent" and measure != "ratio":
+        return f"{function} gives a percent; the spec measures {measure or answer_type}"
+    if answer_type == "percent" and "ratio" not in kinds:
+        return f"{function} gives a {kinds[0]}, not a percent"
+    if measure in JUDGED and measure not in kinds and not any({measure, k} <= s for s in SAME for k in kinds):
+        return f"{function} gives a {'/'.join(kinds)}; the spec measures {measure}"
+    return ""
 
 
 @dataclass
@@ -77,9 +119,10 @@ def _is_base_unit(unit: Any, args: dict, tools: dict) -> bool:
         return False
 
 
-def resolve_reference(call: Any, tools: dict, answer_type: str | None = None) -> tuple[Reference | None, str]:
+def resolve_reference(call: Any, tools: dict, answer_type: str | None = None, measure: str | None = None) -> tuple[Reference | None, str]:
     """(reference, "") or (None, why the call was dropped). Arguments the function takes pass unchanged; the others are repaired
-    when they are formalities (module doc), else the call is dropped. A repaired call needs `answer_type` "number"."""
+    when they are formalities (module doc), else the call is dropped. A repaired call needs `answer_type` "number". A call whose
+    value is not the kind of answer the spec asks for (`kind_conflict`) is dropped."""
     call = clean_call(call)
     if call is None:
         return None, "malformed call (unknown function, a list / dict argument or a date that is not YYYY-MM-DD)"
@@ -103,6 +146,8 @@ def resolve_reference(call: Any, tools: dict, answer_type: str | None = None) ->
             return None, f"argument {k}={v!r}: {call['function']} does not take it (a condition it cannot express)"
     if repaired and answer_type != "number":
         return None, f"repaired call ({', '.join(repaired)} removed) is used only for a number answer; the spec asks for {answer_type!r}"
+    if why := kind_conflict(call["function"], args, key, answer_type, measure):
+        return None, f"not the kind of answer asked: {why}"
     try:
         inspect.signature(fn).bind(**args)
         value = fn(**args)
@@ -119,10 +164,10 @@ def resolve_reference(call: Any, tools: dict, answer_type: str | None = None) ->
     return Reference({"function": call["function"], "args": args}, value, key), ""
 
 
-def build_reference(call: Any, tools: dict, answer_type: str | None = None) -> Reference | None:
+def build_reference(call: Any, tools: dict, answer_type: str | None = None, measure: str | None = None) -> Reference | None:
     """Run the call on this business's engine functions; None when it is malformed, unavailable, raises, or has an argument that
     cannot be repaired (see resolve_reference)."""
-    return resolve_reference(call, tools, answer_type)[0]
+    return resolve_reference(call, tools, answer_type, measure)[0]
 
 
 def _num(x) -> float | None:

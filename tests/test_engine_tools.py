@@ -79,3 +79,27 @@ def test_average_order_rounds_half_a_dong_up():
     sales2 = SalesView(pd.DataFrame({"order": ["A", "B"], "date": pd.to_datetime(["2026-05-01", "2026-05-02"]),
                                      "amount": [100.0, 249.0], "valid": [True, True]}), "ban", "Thành tiền", "Mã đơn", "Ngày", "readme")
     assert build_tools(sales2, None)["sales_metrics"]("2026-05-01", "2026-05-31")["avg_order"] == 175   # 174.5 -> 175 (round: 174)
+
+
+def test_reference_must_be_the_kind_of_answer_asked():
+    from datamate.engines.reference import kind_conflict
+    # dev300: a percent for "bị huỷ mấy đơn", a quantity for a revenue percent, a revenue ranking for "nhiều đơn nhất"
+    assert kind_conflict("cancel_rate", {}, None, "number", "orders")
+    assert kind_conflict("size_qty", {"size": "ca chiều"}, None, "percent", "ratio")
+    assert kind_conflict("top_customers", {"k": 1}, None, "string", "count")
+    assert not kind_conflict("top_customers", {"k": 5}, None, "list", "money")
+    assert not kind_conflict("cancel_rate", {}, None, "percent", "ratio")
+    assert not kind_conflict("sales_metrics", {}, "orders", "number", "count")          # an order count is a count
+    assert kind_conflict("sales_metrics", {}, "revenue", "number", "orders")
+    assert not kind_conflict("sales_metrics", {}, None, "number", "orders")              # several metrics: not judged
+    assert not kind_conflict("item_qty_change", {}, None, "percent", "ratio")
+    assert kind_conflict("top_items", {"by": "qty"}, None, "list", "money")
+    assert not kind_conflict("top_items", {"by": "amount"}, None, "list", "money")
+    assert not kind_conflict("item_qty", {}, None, "number", None)                       # no measure: not judged
+
+
+def test_unknown_size_fails_loudly():
+    t = build_tools(SALES, ITEMS)
+    assert t["size_qty"]("M", "2026-05-01", "2026-05-31") == 3
+    with pytest.raises(ValueError, match=r"sizes in the item names are \['M'\]"):
+        t["size_qty"]("ca chiều", "2026-05-01", "2026-05-31")       # dev300: a shift passed as a size gave 0

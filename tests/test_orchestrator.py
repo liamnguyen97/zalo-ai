@@ -285,20 +285,22 @@ class _Tools:
     """Inputs stub: the real sandbox variables plus one engine function."""
     def variables(self, st):
         return {"tables": {k: v.copy() for k, v in TABLES.items()}, "debt_repaid": lambda start, end, customer=None: 7,
+                "item_qty": lambda item, start, end: 7,
                 "period_start": pd.Timestamp("2026-05-01"), "period_end": pd.Timestamp("2026-05-31")}
 
 
 def test_a_coder_that_disagrees_with_the_engine_reference_is_sent_back_once():
-    call = {"function": "debt_repaid", "args": {"start": "2026-05-01", "end": "2026-05-31"}}
+    # a quantity function: the question asks "bn cái" (a reference of another kind is dropped, engines/reference.kind_conflict)
+    call = {"function": "item_qty", "args": {"item": "Bánh tiramisu", "start": "2026-05-01", "end": "2026-05-31"}}
     wrong = "```python\nanswer = len(tables['don']) + 2\n```"
-    right = "```python\nanswer = debt_repaid(period_start, period_end)\n```"
+    right = "```python\nanswer = item_qty('Bánh tiramisu', period_start, period_end)\n```"
     m = Scripted(code=[wrong, right], explain=[{"spec": {**SPEC, "engine_call": call}}], orch=[{"action": "coder"}])
     st = _st()
     o = _orch(m)
     o.inputs = _Tools()
     assert o.run(st) == {"type": "number", "answer": 7}
-    assert "ENGINE REFERENCE" in m.prompts("code")[0] and "debt_repaid(" in m.prompts("code")[0]
-    assert "0. FIRST call `debt_repaid(start='2026-05-01', end='2026-05-31')`" in m.prompts("code")[0]   # the plan did not name it
+    assert "ENGINE REFERENCE" in m.prompts("code")[0] and "item_qty(" in m.prompts("code")[0]
+    assert "0. FIRST call `item_qty(item='Bánh tiramisu', start='2026-05-01', end='2026-05-31')`" in m.prompts("code")[0]   # the plan did not name it
     assert any(e.get("plan_engine_step") for e in st.log["orchestrator"])
     assert st.log["turns"][0]["issues"] == ["engine_mismatch"] and st.log["turns"][0]["verdict"]["source"] == "checks"
     # a Coder that keeps its own value on the second turn is trusted
@@ -740,8 +742,8 @@ def test_a_value_the_judge_rejected_and_the_coder_returned_unchanged_is_accepted
 
 def test_no_judge_when_the_value_equals_an_exact_engine_function():
     from datamate.answer.evaluator import JUDGE_SYSTEM
-    call = {"function": "debt_repaid", "args": {"start": "2026-05-01", "end": "2026-05-31"}}
-    right = "```python\nanswer = debt_repaid(period_start, period_end)\n```"
+    call = {"function": "item_qty", "args": {"item": "Bánh tiramisu", "start": "2026-05-01", "end": "2026-05-31"}}
+    right = "```python\nanswer = item_qty('Bánh tiramisu', period_start, period_end)\n```"
     m = Scripted(code=[right], explain=[{"spec": {**SPEC, "engine_call": call}}])
     o = _orch(m, skip_judge_on_engine=True)
     o.inputs = _Tools()
@@ -754,7 +756,7 @@ def test_no_judge_when_the_value_equals_an_exact_engine_function():
     st2 = _st()
     assert o2.run(st2) == {"type": "number", "answer": 7} and len(m2.prompts("judge")) == 1
     assert any(e.get("engine_confirms") for e in st2.log["orchestrator"])   # logged with the switch off too
-    assert "ENGINE VALUE" in m2.prompts("judge")[0] and "debt_repaid(" in m2.prompts("judge")[0]
+    assert "ENGINE VALUE" in m2.prompts("judge")[0] and "item_qty(" in m2.prompts("judge")[0]
     # the routing hint counts as well; a value the engine does not confirm still goes to the judge
     m3 = Scripted(code=[RIGHT])
     o3 = _orch(m3, skip_judge_on_engine=True)

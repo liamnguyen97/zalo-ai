@@ -27,7 +27,14 @@ Trạng thái: `TODO` · `DOING` · `DONE` · `BACKLOG`
 | D1 | Gộp lexicon thành một dict chung + phương ngữ | DONE | public 26 câu đọc đúng hơn |
 | B5 | `find_names`: khớp "inside one value" quá rộng | DONE | 83 tên rác bị bỏ |
 | B6 | `debt.METHOD_COL` thiếu `Thanh toán bằng` (dev_008) | DONE | 0/10 shop công nợ đổi |
-| B7 | Công nợ ghi trong ghi chú đơn (dev_008: không có phiếu thu) | BACKLOG | chưa đo |
+| B7 | Công nợ ghi trong ghi chú đơn (dev_008: không có phiếu thu) | DONE (P3.1b) | 0 dev300 (không câu nợ ở các shop này) |
+| P2.1 | Mã đơn dạng STT, "mỗi dòng một phiếu", điền ô cấp đơn | DONE | 0 dev300; public dev_011/012/014 (153 câu) có `sales_orders`, trusted |
+| P2.2 | Bảng viết tắt → tên đầy đủ + category (theo hình dạng) | DONE | 0 dev300; public dev_011/014 (103 câu) |
+| P2.5' | Cổng "ref cùng loại với đáp án" (thay abstain khi `engine_mismatch`) | DONE | replay 3 run dev300: bỏ 17 ref sai, 0 ref đúng |
+| P2.3' | Gate §7 "shop không ghi loại thông tin này" (thay phần từ điển tính chất) | DONE | train 28 lần bắn, 28 gold unanswerable, 0 sai |
+| P3.1a | Tên người: bỏ kính ngữ, khớp tên gọi với danh sách (duy nhất) | DONE | 0 dev300; public dev_012 |
+| P2.4 | `missing_fields` trùng tên cột bị bỏ; fact "kỳ chỉ phủ một phần" | DONE | ~0 (1 spec dev300 khai, khai đúng) |
+| P3.1c | Engine lô / hạn dùng (§6) | DONE | train 10/10 câu hạn dùng khớp gold qua hàm |
 | B3 | Route mới: `debt_by_customer`, xếp hạng khách theo số đơn; engine `customers(...)` | BACKLOG | ~5 câu (báo cáo dev300) |
 
 ---
@@ -214,3 +221,78 @@ Bối cảnh: cụm lỗi lớn nhất của dev300 là "engine đã có số đ
   nợ ghi trong cột `Note` của đơn), nên việc thiếu tên cột chưa làm sai số nào. Snapshot công nợ 44 shop (10 có engine): **0 thay đổi** (số đơn ghi nợ, tổng
   nợ cuối kỳ, top 3 khách nợ). Test mới: cột `Thanh toán bằng` và cột README khai báo cho cùng tổng nợ 220; không tìm thấy cột thì đơn COD bị tính là nợ
   (300) — lý do phải tìm được cột. Mở **B7**: engine công nợ cho shop ghi nợ trong ghi chú đơn.
+
+
+---
+
+## P2–P3 (error-analysis-proposal.md), làm 2026-11-03
+
+Thứ tự đã chốt: P2.1 → P2.2 → cổng ref cùng loại → gate §7 → tên người → P2.4 → engine nghiệp vụ. P3.2 (seed, `predict.sh`, Dockerfile) để
+riêng. Chưa chạy model: mọi số dưới đây đo offline (snapshot 44 shop trước / sau, replay log dev300, gold train).
+
+**Kiểm đối chứng chung.** Snapshot `BusinessContext.build` của 30 shop train + 14 shop public trước và sau: shop train duy nhất đổi là 5 shop
+có engine nợ mới (biz_108/110/119/120/128, train không có câu nợ nào ở các shop này). Không bảng, cột, số đơn, doanh thu nào của train đổi.
+
+### P2.1 Mã đơn từ số thứ tự (harness)
+- `data/loader.derive_order_ids`: cột số nguyên mà từ dòng này sang dòng sau chỉ +0 (dòng khác của cùng đơn) hoặc +1 (đơn kế), chỉ được
+  đánh lại ở chỗ đổi sheet / ngày bán, ít số hơn số dòng. Bị loại: bộ đếm dòng, cột ngày-trong-tháng, số dòng trong một chứng từ đã có mã
+  (biz_119/120 `DanhSachChiTietNhapHang.STT`: bị bắt ở lượt đầu, đã chặn). README: role `order_no` ("số thứ tự đơn") bỏ qua kiểm bước; câu
+  "các dòng cùng **STT** là một đơn" chỉ ưu tiên thử trước (câu không nêu bảng: sổ góp của dev_014 cũng có `STT`).
+- Thêm cột text `Mã đơn (STT)` = chính số đó (sổ khác tham chiếu "STT 26"); có sẵn mã đơn thì không làm gì. Sau đó `_fill_groups`,
+  dòng trùng, `status_std` theo đơn, `sales_orders` chạy như mọi shop.
+- "Mỗi dòng một phiếu": không mã đơn + README "mỗi dòng một lượt/phiếu/đơn" hoặc bảng không có cột hàng / số lượng → `SalesView.row_docs`,
+  `sales_orders` một dòng mỗi phiếu. README "không ghi tên khách" → mọi đơn là khách lẻ (trước: cột `Làm gì` bị nhận là tên khách, 3.188 "khách").
+- Kèm: dòng không còn ô nào sau khi parse là chú thích cuối sheet ("Ghi chú: số liệu ghi tay"), bị bỏ; `IMEI`, `SĐT`, `serial` giữ dạng text.
+- Bất biến: dev_011 3.819 đơn = 3.819 ô `Khách trả`; dev_014 6.334 đơn; dev_012 6.060 phiếu (18 dòng chú thích bị bỏ). dev_014 bỏ 175
+  dòng trùng trong cùng đơn (40 dòng trùng cả IMEI: lỗi xuất file theo §8).
+- Rủi ro đã biết: shop sửa xe giờ trusted, nên `sales_metrics.avg_order` chia cho mọi phiếu, trong khi §6 Sửa xe chỉ chia cho phiếu có thu tiền.
+  Public: 3/50 câu dev_012 hỏi "bình quân 1 phiếu (có thu tiền)" có thể nhận ref / hint sai.
+
+### P2.2 Bảng viết tắt (harness)
+- `data/aliases.py`: bảng ≤ 2.000 dòng có cột ngắn K và cột tên dài F (unique, tên chứ không phải mã) sao cho cột tên hàng của bảng khác
+  được ghi ≥ 80 % bằng K hoặc F (so sau `fold`) và ≥ 5 % chỉ bằng K. Không ghi đè cột gốc: thêm `<cột> (tên đầy đủ)` và các cột loại
+  (`Loại`); `item_lines` đếm theo tên đầy đủ; `item_qty("Sạc 25W SS")` = `item_qty("Củ sạc nhanh 25W Samsung")`.
+- Biên: dương tính dev_011 0,90 / dev_014 0,80 phần chỉ-viết-tắt; 46 cặp catalog còn lại của 44 shop đều 0,00.
+
+### Cổng "ref cùng loại với đáp án" (thay P2.5, harness)
+- `engines/reference.RETURNS`: mỗi hàm khai loại giá trị (money / quantity / orders / count / ratio). `kind_conflict` bỏ ref khi loại khác
+  `measure` / `answer_type` của spec (orders ≈ count). Áp cho cả hint. `size_qty` báo lỗi với size không có trong dữ liệu.
+- Replay `engine_reference` của 3 run dev300 (20261102-153007, 20261103-050449, 20261103-070503): bỏ 17, cả 17 khác gold
+  (`cancel_rate` cho "mấy đơn huỷ", `size_qty('ca chiều')`, `top_customers` cho "nhiều đơn nhất"); giữ 323 ref đúng gold; hint không bỏ cái nào.
+
+### Gate §7 "shop không ghi loại thông tin này" (thay phần từ điển P2.3, harness)
+- `agents/coverage.NEEDS`: giới tính, địa chỉ, tồn kho, nhập hàng, giá vốn, nợ, hạn dùng, khách có tên. Mỗi loại = mẫu câu hỏi (trên
+  `norm`) + bằng chứng dữ liệu (tên cột tách CamelCase, mô tả cột README, tên bảng, engine; giới tính còn xét nhãn Nam/Nữ). Chạy trước
+  Explainer, không cần spec; `DATAMATE_COVERAGE_GATE=fact|on|off` (mặc định fact: chỉ là một dòng VERIFIED FACTS cho Coder; on: trả
+  `unanswerable` trước mọi lời gọi model; ghi vào run meta).
+- Đo `scripts/coverage_report.py train`: 28 lần bắn, cả 28 gold unanswerable, 0 câu answerable. Hai lỗi bắt được khi đo và đã sửa:
+  "dán ống" fold thành "đàn ông"; "Phương" (tên) khớp "phường". Public: 5 lần bắn (khách nữ ×2, khách ở đường ×3); đã sửa 2 lần bắn sai
+  thấy được ("nhập thêm máy cũ" là câu bán, "xe khách quen" tính theo biển số).
+- Thăm dò thêm (không có trong train): "khách <tên thật của shop> mua bao nhiêu" trên 44 shop, và "khách năm nay / số khách năm 2025".
+  Lượt đầu bắn sai hàng trăm lần: họ "Dương" fold thành "duong" (= đường), "năm" fold thành "nam". Đã sửa: "khách đường" đọc trên câu gốc
+  có dấu; câu không dấu thì bỏ qua khi chữ sau "khách" là đầu một tên khách có trong dữ liệu; "nam" theo sau bởi năm / nay / ngoái... là
+  năm. Sau sửa: 0 lần bắn sai ở địa chỉ / giới tính; train vẫn 28/0, public vẫn 5. Còn lại trong thăm dò là "khách X nợ bao nhiêu" ở shop
+  không ghi nợ, đúng §7.
+- Đường CLI thật (model không truy cập được): 4 câu train bị chặn ra `unanswerable`, 0 lời gọi model, `check_format.py` /
+  `p45_report.py` đọc được log không có `explainer`.
+- dev300: bắt được q_95099c4916a8, q_ee9d6f998de7 (khách nữ), q_05a8b30443a1 (shop không ghi khách) — trần, vì đo trên dữ liệu đã nhìn.
+
+### Tên người (P3.1a, harness)
+- `text.given_name`: bỏ kính ngữ đứng trước một tên ("A.Đức", "a Đức", "chị Lan"); tên một chữ giữ nguyên ("Anh", "An").
+- `data/aliases.find_nicknames`: cột ≤ 60 cách viết, ≥ 90 % dòng là MỘT tên gọi trùng tên gọi của đúng một người trong bảng danh sách
+  → thêm `<cột> (họ tên)`. Không áp cho khoá khách (§3). Chỉ dev_012 đổi.
+
+### P2.4 (harness)
+- `explainer.recorded_column`: `missing_fields` mà một cột mang đúng tên đó (mọi chữ, theo thứ tự) bị bỏ, có log.
+- `facts.py`: kỳ chỉ một phần nằm trong khoảng ngày có dữ liệu → dòng fact "tính trên phần có dữ liệu (§7), không phải unanswerable".
+
+### Engine nghiệp vụ (P3.1b, c — case-specific)
+- Nợ ghi trên đơn (`debt.build_snapshot_debt`): cột README mô tả "khách còn nợ của đơn" hoặc ghi chú README nói ghi nợ ở đó
+  (`owed_from_note`: "ghi nợ X, đã trả đủ" → 0, "còn thiếu Y" → Y, "đưa trước X, còn lại ghi sổ" → tổng − X...). Chỉ biết số dư ở ngày cuối
+  dữ liệu: ngày sớm hơn, `debt_repaid`, `debt_new` báo lỗi rõ. Không kiểm được bằng gold (train không có câu nợ ở các shop này).
+- Lô / hạn dùng (`engines/lots.py`): bảng lô (mã lô unique, hạn dùng, số lượng cơ bản), bảng bán theo lô (mã lô + mã đơn), ngày nhập
+  (của lô hoặc của phiếu), tiền lô (dòng nhập có mã lô, không thì giá ở bảng lô). Hàm `expiring_lots / expiring_items / expiring_value /
+  nearest_expiry`. Train: 10/10 câu hạn dùng của biz_123 / biz_124 khớp gold khi gọi hàm. Dựng ở biz_119/120/123/124, dev_006.
+- Hàm không có dữ liệu thì không đưa cho Coder: `top_customers` khi không đơn nào có tên khách (dev_012, biz_112, biz_130),
+  `debt_repaid` / `debt_new` khi shop chỉ ghi số dư cuối kỳ.
+- Chưa làm: trả góp, bảo hành, hoa hồng thợ, `due_after` cho sổ hạn nợ (dev_004).

@@ -14,7 +14,7 @@ from typing import Callable
 import pandas as pd
 
 from datamate.engines.debt import DebtView
-from datamate.engines.items import ItemView, fold
+from datamate.engines.items import SIZE, ItemView, fold
 from datamate.engines.orders import top_customers as _top_customers
 from datamate.engines.purchases import PurchaseView, closest as _closest_items
 from datamate.engines.sales import SalesView
@@ -29,7 +29,7 @@ def _num(x: float):
 
 
 def build_tools(sales: SalesView | None, items: ItemView | None, debt: DebtView | None = None,
-                orders: pd.DataFrame | None = None, purchases: PurchaseView | None = None) -> dict[str, Callable]:
+                orders: pd.DataFrame | None = None, purchases: PurchaseView | None = None, lots=None) -> dict[str, Callable]:
     """Functions for the coder sandbox. Dates: 'YYYY-MM-DD' strings or Timestamps, both ends included."""
     tools: dict[str, Callable] = {}
 
@@ -45,6 +45,7 @@ def build_tools(sales: SalesView | None, items: ItemView | None, debt: DebtView 
 
         def _key(item: str) -> str:
             k = fold(item)
+            k = items.aliases.get(k, k)          # a short form from the shop's abbreviation sheet -> its full name
             if k in keys:
                 return k
             names = [items.display.get(c, c) for c in difflib.get_close_matches(k, sorted(keys), n=5, cutoff=0.5)]
@@ -53,7 +54,7 @@ def build_tools(sales: SalesView | None, items: ItemView | None, debt: DebtView 
         def find_items(text: str, n: int = 10) -> list[str]:
             """Item names (exact data spelling) containing `text` (case/diacritics ignored); closest names if none contain it."""
             t = fold(text)
-            hit = sorted(k for k in keys if t and t in k)
+            hit = sorted({k for k in keys if t and t in k} | {v for a, v in items.aliases.items() if t and t in a and v in keys})
             if not hit:
                 hit = difflib.get_close_matches(t, sorted(keys), n=n, cutoff=0.4)
             return [items.display.get(k, k) for k in hit[:n]]
@@ -83,10 +84,15 @@ def build_tools(sales: SalesView | None, items: ItemView | None, debt: DebtView 
             """{'before', 'after', 'pct'}: quantity in the n days from `day` (included) vs the n days right before."""
             return items.change(_key(item), _ts(day), int(n))
 
+        sizes = sorted({m.group(1).upper() for m in items.lines["item"].dropna().astype(str).map(SIZE.search) if m})
+
         def size_qty(size: str, start, end):
             """Quantity of drinks/items of size `size` ('M', 'L', ...) over [start, end]."""
+            if str(size).strip().upper() not in sizes:      # loud, like an unknown item: an unknown size is not 0 drinks
+                raise ValueError(f"no item of size {size!r}; the sizes in the item names are {sizes}")
             return _num(items.size_qty(size, _ts(start), _ts(end)))
 
+        _key_of = _key
         tools.update(find_items=find_items, item_qty=item_qty, item_revenue=item_revenue, item_base_unit=item_base_unit,
                      top_items=top_items, item_price_on=item_price_on, item_qty_change=item_qty_change, size_qty=size_qty)
 
@@ -116,8 +122,9 @@ def build_tools(sales: SalesView | None, items: ItemView | None, debt: DebtView 
             """New debt from credit orders placed in [start, end] (unpaid at the end of the purchase day), optionally one customer."""
             return debt.new_debt(_ts(start), _ts(end), customer)
 
-        tools.update(debt_total=debt_total, debt_by_customer=debt_by_customer, debt_customers=debt_customers,
-                     debt_aging=debt_aging, debt_repaid=debt_repaid, debt_new=debt_new)
+        tools.update(debt_total=debt_total, debt_by_customer=debt_by_customer, debt_customers=debt_customers, debt_aging=debt_aging)
+        if getattr(debt, "flows", True):     # a shop that records only each order's balance at the end of its data has no flows
+            tools.update(debt_repaid=debt_repaid, debt_new=debt_new)
 
     if purchases is not None:  # rulebook §5, see engines/purchases.py
         pkeys = set(purchases.lines["key"].astype(str))
@@ -163,7 +170,35 @@ def build_tools(sales: SalesView | None, items: ItemView | None, debt: DebtView 
             return round(float((w["status_std"] == "cancelled").sum()) / len(w) * 100, 2)
         tools["cancel_rate"] = cancel_rate
 
-    if orders is not None and "customer_key" in orders.columns:   # rulebook §3, see engines/orders.py
+    if lots is not None and items is not None:   # rulebook §6 (pharmacies), see engines/lots.py
+        def expiring_lots(day, n) -> list:
+            """[(item, lot, expiry 'YYYY-MM-DD', remaining base qty, money at the lot's own import price)] of the lots still holding
+            stock at the end of `day` whose expiry date is in [day, day + n] (§6), earliest expiry first, then item code."""
+            e = lots.expiring(_ts(day), int(n)).sort_values(["expiry", "code", "lot"])
+            return [(lots.names.get(r.item_key, r.item_key), r.lot, str(r.expiry.date()), _num(r.remaining), _num(round(r.value, 2)))
+                    for r in e.itertuples()]
+
+        def expiring_items(day, n) -> list:
+            """Item names with a lot still in stock at the end of `day` expiring in [day, day + n] (§6), by earliest expiry, then code."""
+            e = lots.expiring(_ts(day), int(n)).sort_values(["expiry", "code"])
+            return list(dict.fromkeys(lots.names.get(k, k) for k in e["item_key"]))
+
+        def expiring_value(day, n) -> int:
+            """§6 "tiền vốn": money of the stock left at the end of `day` in lots expiring in [day, day + n], each at its own import
+            price per base unit."""
+            return int(round(lots.expiring(_ts(day), int(n))["value"].sum()))
+
+        def nearest_expiry(item: str, day):
+            """§6: the expiry date ('YYYY-MM-DD') of the item's lot that expires first among those still in stock and not expired at
+            `day`; None when no such lot."""
+            d = lots.nearest(_key_of(item), _ts(day))
+            return None if d is None else str(pd.Timestamp(d).date())
+
+        tools.update(expiring_lots=expiring_lots, expiring_items=expiring_items, expiring_value=expiring_value,
+                     nearest_expiry=nearest_expiry)
+
+    # rulebook §3, see engines/orders.py; not offered when no order names a customer (a repair book: every order is a walk-in)
+    if orders is not None and "customer_key" in orders.columns and bool((orders["customer_key"].astype(str) != "").any()):
         def top_customers(k=None, start=None, end=None) -> list:
             """[(customer, revenue)] for valid orders placed in [start, end], largest first; one customer per customer
             code, walk-in orders never ranked (§3). Ties: by customer code."""
@@ -176,7 +211,8 @@ def build_tools(sales: SalesView | None, items: ItemView | None, debt: DebtView 
 
 TOOL_NAMES = ("sales_metrics", "find_items", "item_qty", "item_revenue", "item_base_unit", "top_items", "item_price_on",
               "item_qty_change", "size_qty", "debt_total", "debt_by_customer", "debt_customers", "debt_aging", "debt_repaid",
-              "debt_new", "top_customers", "purchase_total", "purchase_avg_price", "top_supplier", "cancel_rate", "sales_orders")
+              "debt_new", "top_customers", "purchase_total", "purchase_avg_price", "top_supplier", "cancel_rate", "sales_orders",
+              "expiring_lots", "expiring_items", "expiring_value", "nearest_expiry")
 
 # Engines that hard-code one rulebook row keep that row's defining words here. The split's rulebook may differ from the
 # training one (the public / private test rulebooks are not in the repo): when the words are gone, the engine is switched off

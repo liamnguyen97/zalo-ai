@@ -9,7 +9,7 @@ without diacritics; here it is computed in code and validated against the traini
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -62,6 +62,7 @@ class ItemView:
     lines: pd.DataFrame  # order, date, valid, item, key, code, qty, qty_base, unit, base_unit, amount, unit_price, is_item
     table: str
     note: str
+    aliases: dict = field(default_factory=dict)   # folded short form -> folded full name (an abbreviation sheet, data/aliases.py)
 
     def _sel(self, start, end, *, valid: bool = True) -> pd.DataFrame:
         d = self.lines
@@ -167,6 +168,10 @@ def build_items(biz: Business) -> ItemView | None:
     _, n, item, code, qb, q = best
     df = tables[n].copy()
     r = roles.get(n, {})
+    # item names written short in places: count by the full name the abbreviation sheet gives (data/aliases.py)
+    exp = next((e for e in getattr(biz, "expansions", []) if e.table == n and e.column == item and e.full in df.columns), None)
+    if exp is not None:
+        item = exp.full
     oc = r.get("order_id") or find_order_col(df)
     order_key = oc
     if oc is None:
@@ -237,7 +242,8 @@ def build_items(biz: Business) -> ItemView | None:
         "is_item": is_item.values,
     })
     how = "conversion column" if qb else ("conversion table/README" if conv else "no conversion needed")
-    return ItemView(lines, n, f"table `{n}`, item name = `{item}`, quantity = `{qb or q}` ({how})")
+    aliases = {k: fold(v) for k, v in exp.to_full.items() if k != fold(v)} if exp is not None else {}
+    return ItemView(lines, n, f"table `{n}`, item name = `{item}`, quantity = `{qb or q}` ({how})", aliases)
 
 
 def _codes_from_names(lines: pd.DataFrame, tables: dict) -> pd.DataFrame:

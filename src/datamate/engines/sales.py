@@ -17,7 +17,7 @@ import pandas as pd
 
 from datamate.answer.formatter import round_half_up
 from datamate.data.loader import Business, _base_name, _safe
-from datamate.data.readme import roles_by_section, roles_for_tables
+from datamate.data.readme import roles_by_section, roles_for_tables, row_documents
 from datamate.data.status import find_order_col
 from datamate.text import nodia
 
@@ -49,6 +49,7 @@ class SalesView:
     order_col: str | None
     date_col: str
     source: str  # "readme" | "heuristic"
+    row_docs: bool = False  # no order id and each row is a whole document (a repair slip): one row = one order
 
     def metrics(self, start, end) -> dict:
         d = self.lines
@@ -58,6 +59,19 @@ class SalesView:
         rev = float(s["amount"].sum())
         # §3: the average order value is whole đồng, half a đồng rounded UP (Python's round would round half to even)
         return {"revenue": int(round(rev)), "orders": n, "avg_order": round_half_up(rev / n) if n else None, "lines": int(len(s))}
+
+
+# a column that makes a row one LINE of a document: an item name or a quantity (normalised names, as in engines/items.py)
+LINE_COL = re.compile(r"^(ten)?(hang|hanghoa|sanpham|mon|sp|mathang|goi)(hoa|ban)?$|^noidung$|^(soluong|sl|slg|sluong)")
+
+
+def is_row_documents(readme: str, df: pd.DataFrame) -> bool:
+    """A table without order ids whose rows are whole documents: the README says so ("mỗi dòng một lượt xe (một phiếu)"), or no
+    column makes a row a line of something (no item, no quantity). The shops whose README says "mỗi dòng một mặt hàng" have item and
+    quantity columns: their rows stay lines (biz_107 / biz_113 / biz_126 have no orders at all)."""
+    if row_documents(readme):
+        return True
+    return not any(LINE_COL.search(re.sub(r"[\W_]+", "", nodia(str(c)).lower())) for c in df.columns)
 
 
 def _pick_amount(df: pd.DataFrame) -> str | None:
@@ -155,10 +169,12 @@ def build_sales(biz: Business) -> SalesView | None:
         return None
     _, n, oc, amt, source = best
     df = tables[n].copy()
-    if oc is None:  # ledger without order ids: every row is one record (= one order)
+    row_docs = False
+    if oc is None:  # ledger without order ids: every row is one record (= one order when the rows are documents)
         df["__row"] = range(len(df))
         oc = "__row"
         order_key = None
+        row_docs = is_row_documents(biz.readme, tables[n])
     else:
         order_key = oc
     dcol = roles.get(n, {}).get("order_date") or _pick_date(df)
@@ -176,4 +192,4 @@ def build_sales(biz: Business) -> SalesView | None:
     non_item |= (df[amt] < 0).fillna(False)
     lines = pd.DataFrame({"order": df[oc].astype(str).values, "date": df[dcol].values, "amount": df[amt].values,
                           "valid": (valid & ~non_item).values, "order_ok": valid.values, "item": (~non_item).values})
-    return SalesView(lines, n, amt, order_key, dcol, source)
+    return SalesView(lines, n, amt, order_key, dcol, source, row_docs)

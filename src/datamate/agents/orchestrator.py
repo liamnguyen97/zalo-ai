@@ -31,9 +31,9 @@ from datamate.answer.formatter import format_answer
 from datamate.answer.interpreter import Interpretation, as_count, interpret
 from datamate.engines.functions import TOOL_NAMES, rule_gated
 from datamate.data.onboarding import summary
-from datamate.agents.coverage import no_identified_customers, period_outside_data
+from datamate.agents.coverage import coverage_fact, missing_information, no_identified_customers, period_outside_data
 from datamate.agents.shared import shared_context
-from datamate.engines.reference import Reference, agrees, confirms, resolve_reference
+from datamate.engines.reference import Reference, agrees, confirms, kind_conflict, resolve_reference
 from datamate.engines.routing import route
 from datamate.llm import DeadlineExceeded, chat, check_deadline
 from datamate.sandbox.runner import Runner, RunResult
@@ -139,7 +139,7 @@ class Orchestrator:
                  guideline_rows: int = 4, verified_facts: bool = True, decide_mode: str = "rule",
                  skip_judge_on_engine: bool = False, trust_repeat: bool = True, audit_mode: str = "shadow",
                  deadline_fallback: str = "checked", audit_skip: tuple[str, ...] = ("date_literal",),
-                 enforce_hints: tuple[str, ...] = ("item_qty",)):
+                 enforce_hints: tuple[str, ...] = ("item_qty",), coverage_gate: str = "fact"):
         self.model, self.col_selector, self.explainer, self.coder, self.evaluator = model, col_selector, explainer, coder, evaluator
         self.inputs, self.rulebook = inputs, rulebook
         self.max_turns, self.coder_steps, self.explainer_reruns = max_turns, coder_steps, explainer_reruns
@@ -160,6 +160,7 @@ class Orchestrator:
         self.audit_skip = set(audit_skip)       # audits that are only logged even with audit_mode "on"
         self.enforce_hints = set(enforce_hints)  # engine hints the Coder is sent back on once when it differs (precision measured)
         self.deadline_fallback = deadline_fallback     # what a question that runs out of time submits: "checked" | "abstain"
+        self.coverage_gate = coverage_gate             # §7 information the shop does not record (agents/coverage.py): fact | on | off
 
     # ------------------------------------------------------------------ bookkeeping
     def _call(self, st, agent: str, fn, **info):
@@ -218,6 +219,15 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             st.functions = []
         st.context = (shared_context(self.rulebook, st.ctx.readme, st.schema, st.functions) if self.shared_prefix else None)
+        # §7: the question asks for a kind of information the shop does not record (no spec needed: the question's words and the data)
+        needs = missing_information(st.question, st.ctx) if self.coverage_gate != "off" else []
+        if needs:
+            st.log["orchestrator"].append({"coverage_needs": [n.name for n in needs], "mode": self.coverage_gate})
+            direct = [n for n in needs if n.direct] if self.coverage_gate == "on" else []
+            if direct:
+                return format_answer("unanswerable", "UNANSWERABLE: the shop's data records no " + "; no ".join(n.what for n in direct)
+                                     + " (rulebook §7: information the shop does not record).")
+        coverage_note = coverage_fact(needs)
         self._call(st, "explainer", lambda: self.explainer.run(st))
         # a run nearly out of time (config.run_quick_s): one turn and no Explainer re-run (local: the Orchestrator is shared by the workers)
         quick = getattr(st, "quick", False)
@@ -249,13 +259,18 @@ class Orchestrator:
                 st.log["onboarding"] = summary(ob)
             # the reference is an "exact" number: not shown when the shop's engines failed their invariants (mis-detection)
             call = getattr(st.brief, "engine_call", None)
-            st.engine_ref, dropped = (resolve_reference(call, variables, st.answer_type) if call and (ob is None or ob.get("trusted"))
+            st.engine_ref, dropped = (resolve_reference(call, variables, st.answer_type, getattr(st.brief, "measure", None))
+                                      if call and (ob is None or ob.get("trusted"))
                                       else (None, "the shop's engines failed their invariants" if call else ""))
             if dropped and not any("engine_call_dropped" in e for e in st.log["orchestrator"]):
                 st.log["orchestrator"].append({"engine_call_dropped": dropped, "call": call, "turn": turn})   # was silent
             # an advisory hint from the spec's shape when the Explainer named no call (it leaves it null on the standard shapes)
             st.engine_hint = (route(st.brief, variables, variables.get("period_start"), variables.get("period_end"), st.question)
                               if st.engine_ref is None and (ob is None or ob.get("trusted")) else None)
+            if st.engine_hint is not None and (why := kind_conflict(st.engine_hint.call["function"], st.engine_hint.call["args"], None,
+                                                                    st.answer_type, getattr(st.brief, "measure", None))):
+                st.log["orchestrator"].append({"engine_hint_dropped": why, "hint": st.engine_hint.text[:200], "turn": turn})
+                st.engine_hint = None
             if st.engine_hint is not None:
                 st.log["orchestrator"].append({"engine_hint": st.engine_hint.text, "turn": turn})
             if st.engine_ref is not None:
@@ -270,6 +285,8 @@ class Orchestrator:
                                          columns=cols)
                             if self.guideline_rows else [])
             st.facts = verified_facts(st.question, st.brief, variables) if self.verified_facts else ""
+            if coverage_note:
+                st.facts = (st.facts or "# VERIFIED FACTS (counted by the system from the data; counts, not the answer)\n") + coverage_note + "\n"
             st.log.setdefault("coder_inputs", []).append({
                 "turn": turn, "guideline": [f"{e.source}: {e.label or e.text[:60]}" for e in st.guideline],
                 "facts": len(st.facts.splitlines()) - 1 if st.facts else 0, **({"facts_text": st.facts[:3000]} if st.facts else {})})

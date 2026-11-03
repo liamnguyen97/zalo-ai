@@ -121,7 +121,8 @@ spec fields:
       item_price_on(item, day), item_qty_change(item, day, n), size_qty(size, start, end), debt_total(day),
       debt_by_customer(day, k), debt_customers(day), debt_aging(day), debt_repaid(start, end), debt_new(start, end),
       top_customers(k, start, end), purchase_total(start, end), purchase_avg_price(item, start, end, unit),
-      top_supplier(start, end, k). Examples: {"function": "debt_repaid", "args": {"start": "2026-07-01", "end": "2026-07-28"}};
+      top_supplier(start, end, k), expiring_items(day, n), expiring_value(day, n), nearest_expiry(item, day).
+      Examples: {"function": "debt_repaid", "args": {"start": "2026-07-01", "end": "2026-07-28"}};
       {"function": "top_items", "args": {"k": 3, "start": "2026-03-01", "end": "2026-03-31", "by": "qty"}}.
       "best-selling" ranks by qty. Use null when no function fits exactly or you are unsure;
   missing_fields: [Vietnamese names of properties the question needs that NO column of the schema records, e.g. "giới tính
@@ -182,6 +183,8 @@ cancel_rate(start, end) = % of the orders placed in the period that were cancell
 PURCHASES (when the shop has them): purchase_total(start, end) = money of the purchase slips dated in the period, cancelled slips left
 out; purchase_avg_price(item, start, end, unit) = average import price of an item per `unit` ("một thùng" -> 'thùng'), weighted by the
 quantity bought; top_supplier(start, end, k) -> [(supplier, money)]. A purchase slip's total column covers EVERY item on the slip.
+LOTS (when the shop has them, §6): expiring_items(day, n) / expiring_value(day, n) = items / money of the stock left in lots expiring
+in [day, day + n]; nearest_expiry(item, day) = the expiry date of the item's first-expiring lot still in stock.
 TABLE `sales_orders`: one row per order, `revenue` already follows §1, `valid`, `customer`, `walk_in` + every column of the order
 table: revenue / order count with a condition (channel, staff, customer group, payment, shift) = filter this table, then sum `revenue`."""
 
@@ -477,6 +480,14 @@ def repair_spec(d, tables: dict, as_of: str, tools: DataTools | None = None,
     s.tables = keep
     s.engine_call = clean_call(s.engine_call) if s.engine_call else None
     s.missing_fields = [str(x) for x in s.missing_fields if str(x).strip()] if isinstance(s.missing_fields, list) else []
+    if s.missing_fields:
+        # a field the model says no column records, that a column of the shop IS named after: not missing (it would turn
+        # `answerable` off, and with it the runner's coverage bounce)
+        found = {f: c for f in s.missing_fields if (c := recorded_column(f, tables))}
+        if found:
+            s.missing_fields = [f for f in s.missing_fields if f not in found]
+            notes.append("harness: missing_fields " + ", ".join(f"{f!r} is recorded (column `{c}`)" for f, c in found.items())
+                         + " -> removed")
     if s.missing_fields and s.answerable is not False:
         s.answerable = False
         s.unanswerable_reason = "The data records no column for: " + ", ".join(s.missing_fields)
@@ -484,6 +495,21 @@ def repair_spec(d, tables: dict, as_of: str, tools: DataTools | None = None,
     if s.answerable is False and not str(s.unanswerable_reason or "").strip():
         errs.append("answerable=false needs unanswerable_reason")
     return s, errs, warns, notes
+
+
+def recorded_column(field_name: str, tables: dict) -> str | None:
+    """`table`.`column` whose name is the field ("giới tính" -> `Giới tính`, `GioiTinh`, `Giới tính KH`): every word of the field, in
+    order, is a word of the column name. None when no column is (or the field is too short to tell)."""
+    from datamate.agents.coverage import _words      # the same CamelCase / underscore reading as the coverage check
+    f = fold_text(field_name)
+    if len(f.replace(" ", "")) < 4:
+        return None
+    pat = re.compile(rf"(?<!\w){re.escape(f)}(?!\w)")
+    for t, df in (tables or {}).items():
+        for c in df.columns:
+            if c not in ("source_sheet", "status_std", "valid_order") and df[c].notna().any() and pat.search(_words(c)):
+                return f"{t}`.`{c}"
+    return None
 
 
 def counts_names(measure: str | None, s: Spec) -> bool:

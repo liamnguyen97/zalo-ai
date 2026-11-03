@@ -40,7 +40,9 @@ def _header(biz: Business, orders: pd.Series, skip: str) -> tuple[str, pd.DataFr
 
 
 def build_orders(biz: Business, sales: SalesView | None) -> pd.DataFrame | None:
-    if sales is None or sales.order_col is None:
+    """One row per order. A book whose rows are whole documents and that writes no order id (a repair book: one row per slip)
+    has one order per row, `order` being the row number."""
+    if sales is None or (sales.order_col is None and not sales.row_docs):
         return None
     L = sales.lines
     g = L.groupby("order", sort=False)
@@ -52,15 +54,18 @@ def build_orders(biz: Business, sales: SalesView | None) -> pd.DataFrame | None:
     out.index.name = "order"
     out = out.reset_index()
     out.loc[~out["valid"], "revenue"] = 0.0      # §1: cancelled / returned orders bring no revenue
-    hdr = _header(biz, out["order"], "")
+    hdr = _header(biz, out["order"], "") if sales.order_col is not None else None
     if hdr is not None and out["order"].isin(_ids(hdr[1][hdr[2]])).mean() < COVERAGE:
         hdr = None      # e.g. a payments table with one row per PAID order (dev_003): it lacks the unpaid orders and the order columns
     if hdr is None and sales.table in biz.tables:      # no order table: the sales lines carry the order's columns
-        hdr = sales.table, biz.tables[sales.table], sales.order_col
+        if sales.order_col is None:                    # one row per document: the row number is the id (as in the sales lines)
+            hdr = sales.table, biz.tables[sales.table].assign(__row=range(len(biz.tables[sales.table]))), "__row"
+        else:
+            hdr = sales.table, biz.tables[sales.table], sales.order_col
     if hdr is not None:
         t, df, oc = hdr
         h = df.assign(__k=_ids(df[oc])).drop_duplicates("__k")
-        keep = [c for c in h.columns if c not in ("valid_order", "__k") and c not in out.columns
+        keep = [c for c in h.columns if c not in ("valid_order", "__k") and not str(c).startswith("__") and c not in out.columns
                 and (t != sales.table or c != sales.amount_col)]      # a line amount is not the order's
         out = out.merge(h[["__k"] + keep], left_on="order", right_on="__k", how="left").drop(columns="__k")
         key, name = _customer(biz, h.set_index("__k").reindex(out["order"]).reset_index(drop=True), t)

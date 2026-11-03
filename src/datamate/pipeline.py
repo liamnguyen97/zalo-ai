@@ -53,7 +53,7 @@ class Pipeline:
             guideline_rows=s.guideline_rows, verified_facts=s.verified_facts, decide_mode=s.decide_mode,
             skip_judge_on_engine=s.skip_judge_on_engine, trust_repeat=s.trust_repeat, audit_mode=s.audit_mode,
             deadline_fallback=s.deadline_fallback, audit_skip=s.audit_skip,
-            enforce_hints=s.enforce_hints)
+            enforce_hints=s.enforce_hints, coverage_gate=s.coverage_gate)
         self._ctx: dict[str, BusinessContext] = {}
         self._ctx_lock = threading.Lock()
 

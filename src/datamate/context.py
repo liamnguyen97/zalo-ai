@@ -22,8 +22,9 @@ from datamate.data.descriptor import describe_business
 from datamate.data.loader import Business, load_business
 from datamate.data.onboarding import onboard
 from datamate.data.structure import Structure, detect_structure
-from datamate.engines.debt import DebtView, build_debt
+from datamate.engines.debt import DebtView, build_debt, build_snapshot_debt
 from datamate.engines.items import ItemView, build_items
+from datamate.engines.lots import build_lots
 from datamate.engines.orders import build_orders
 from datamate.engines.purchases import PurchaseView, build_purchases
 from datamate.engines.sales import SalesView, build_sales
@@ -64,21 +65,24 @@ class BusinessContext:
     onboarding: dict | None = None         # data/onboarding.py: detected columns + invariants, `trusted` gates the engine reference
     structure: Structure | None = None     # data/structure.py: parent/child tables, document totals, README notes, aliases
     purchases: PurchaseView | None = None  # engines/purchases.py: purchase lines with slip date / status / supplier (rulebook §5)
+    lots: Any = None                       # engines/lots.py: lots, what each still holds on a day, expiry (rulebook §6)
 
     @classmethod
     def build(cls, biz_dir: str | Path) -> "BusinessContext":
         biz = load_business(biz_dir)
         sales = _safe_build(build_sales, biz)
-        items, debt = _safe_build(build_items, biz), _safe_build(build_debt, biz)
+        items, debt = _safe_build(build_items, biz), _safe_build(build_debt, biz) or _safe_build(build_snapshot_debt, biz)
         orders = _safe_build(lambda b: build_orders(b, sales), biz)
         flag = lambda name: os.getenv(name, "1").strip().lower() in {"1", "true", "yes", "on"}   # noqa: E731
         found = detect_structure(biz.tables, biz.readme)
         structure = found if flag("DATAMATE_STRUCTURE_CARDS") else None          # cards: A/B switch
         purchases = _safe_build(lambda b: build_purchases(b, items, found), biz) if flag("DATAMATE_PURCHASE_ENGINE") else None
+        lots = _safe_build(lambda b: build_lots(b, items, orders), biz)
         report = onboard(biz, sales, items, debt, orders, purchases)
+        report["engines"]["lots"] = lots is not None
         if structure is not None:
             report["structure"] = structure.summary()
-        return cls(biz, describe_business(biz, structure), sales, items, debt, orders, report, structure, purchases)
+        return cls(biz, describe_business(biz, structure), sales, items, debt, orders, report, structure, purchases, lots)
 
     @property
     def tables(self) -> dict[str, pd.DataFrame]:

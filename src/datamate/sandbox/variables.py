@@ -37,7 +37,7 @@ class Runner:
         key = id(ctx)
         if key not in self._tools:
             self._tools[key] = build_tools(getattr(ctx, "sales", None), getattr(ctx, "items", None), getattr(ctx, "debt", None),
-                                           getattr(ctx, "orders", None), getattr(ctx, "purchases", None))
+                                           getattr(ctx, "orders", None), getattr(ctx, "purchases", None), getattr(ctx, "lots", None))
         return self._tools[key]
 
     def item_lines(self, ctx) -> pd.DataFrame | None:
